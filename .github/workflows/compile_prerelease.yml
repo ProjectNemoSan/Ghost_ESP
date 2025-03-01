@@ -94,7 +94,7 @@ jobs:
           echo "Zip file $ZIP_FILE created."
           ls -lh "$ZIP_FILE"
       - name: Upload Build Artifacts to GitHub
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.target.zip_name }}
           path: ${{ matrix.target.zip_name }}
@@ -111,7 +111,7 @@ jobs:
           fetch-depth: 0  # This ensures we have all commit history
 
       - name: Download All Artifacts
-        uses: actions/download-artifact@v3
+        uses: actions/download-artifact@v4
         with:
           path: all_artifacts
 
