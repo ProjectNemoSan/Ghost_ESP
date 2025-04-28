@@ -1,4 +1,4 @@
-name: Compile Test Build (v5.4.1)
+name: Compile Test Build (v5.4)
 
 on:
   workflow_dispatch: # Manual trigger
@@ -36,17 +36,40 @@ jobs:
 
       - uses: actions/setup-python@v5
         with:
-          python-version: '3.9' # Keep consistent with previous workflow, v5.4 might prefer newer but 3.9 is safe
+          python-version: '3.9'
+          cache: 'pip' # Enable caching for pip packages
 
-      - name: Install ESP-IDF Dependencies
+      - name: Cache ESP-IDF Tools
+        id: cache-esp-tools
+        uses: actions/cache@v4
+        with:
+          path: ~/.espressif
+          key: esp-tools-${{ runner.os }}-v5.4 # Using v5.4 as the key part
+
+      - name: Cache ESP-IDF v5.4
+        id: cache-esp-idf
+        uses: actions/cache@v4
+        with:
+          path: ~/esp-idf
+          key: esp-idf-${{ runner.os }}-v5.4 # Using v5.4 as the key part
+
+      - name: Install ESP-IDF System Dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y wget git flex bison gperf python3-pip python3-setuptools cmake ninja-build ccache libffi-dev libssl-dev dfu-util
 
-      - name: Install ESP-IDF v5.4
+      - name: Install ESP-IDF v5.4 (if not cached)
+        if: steps.cache-esp-idf.outputs.cache-hit != 'true'
         run: |
+          echo "ESP-IDF cache miss. Cloning repository..."
           git clone -b v5.4 --depth 1 --recursive https://github.com/espressif/esp-idf.git ~/esp-idf
-          ~/esp-idf/install.sh esp32,esp32s2,esp32s3,esp32c3,esp32c6 # Specify all targets needed
+
+      - name: Install ESP-IDF Tools (if not cached)
+        # Run install script if either IDF or Tools cache missed
+        if: steps.cache-esp-idf.outputs.cache-hit != 'true' || steps.cache-esp-tools.outputs.cache-hit != 'true'
+        run: |
+          echo "ESP-IDF Tools cache miss or IDF cache miss. Running install script..."
+          ~/esp-idf/install.sh esp32,esp32s2,esp32s3,esp32c3,esp32c6
 
       - name: Apply Custom SDK Config
         run: cp "${{ matrix.target.sdkconfig_file }}" sdkconfig.defaults
