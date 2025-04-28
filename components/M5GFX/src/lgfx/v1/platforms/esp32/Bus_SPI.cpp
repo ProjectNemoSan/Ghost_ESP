@@ -1085,18 +1085,6 @@ label_start:
     dmadesc->qe.stqe_next = nullptr;
   }
 
-  void Bus_SPI::set_write_len(uint32_t bitlen)
-  {
-    volatile uint32_t* spi_mosi_dlen_reg_ptr = reg(SPI_MOSI_DLEN_REG(_spi_port));
-    *spi_mosi_dlen_reg_ptr = bitlen - 1;
-  }
-
-  __attribute__ ((always_inline)) inline void Bus_SPI::set_read_len( uint32_t bitlen)
-  {
-    volatile uint32_t* spi_miso_dlen_reg_ptr = reg(SPI_MISO_DLEN_REG(_spi_port));
-    *spi_miso_dlen_reg_ptr = bitlen - 1;
-  }
-
 //----------------------------------------------------------------------------
  }
 }
