@@ -1,3 +1,5 @@
+add_compile_options(-Wno-error=array-bounds)
+
 set(COMPONENT_ADD_INCLUDEDIRS
     src
     )
