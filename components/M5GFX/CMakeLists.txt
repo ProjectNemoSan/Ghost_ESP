@@ -15,7 +15,8 @@ file(GLOB SRCS
      src/lgfx/v1/touch/*.cpp
      )
 set(COMPONENT_SRCS ${SRCS})
-set(COMPONENT_ADD_CXXFLAGS "-Wno-error=array-bounds")
+list(APPEND COMPONENT_ADD_CXXFLAGS -Wno-error=array-bounds)
+list(APPEND COMPONENT_ADD_C_FLAGS -Wno-error=array-bounds)
 
 if (IDF_VERSION_MAJOR GREATER_EQUAL 5)
     set(COMPONENT_REQUIRES nvs_flash efuse driver esp_timer esp_lcd)
