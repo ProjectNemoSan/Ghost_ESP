@@ -248,8 +248,10 @@ namespace lgfx
     *_spi_user_reg = _user_reg;
     auto spi_port = _spi_port;
     (void)spi_port;
-    *reg(SPI_PIN_REG(spi_port)) = pin;
-    *reg(SPI_CLOCK_REG(spi_port)) = clkdiv_write;
+    volatile uint32_t* spi_pin_reg_ptr = reg(SPI_PIN_REG(spi_port));
+    *spi_pin_reg_ptr = pin;
+    volatile uint32_t* spi_clock_reg_ptr = reg(SPI_CLOCK_REG(spi_port));
+    *spi_clock_reg_ptr = clkdiv_write;
 #if defined ( SPI_UPDATE )
     *_spi_cmd_reg = SPI_UPDATE;
 #endif
@@ -831,9 +833,10 @@ label_start:
       auto pin_reg = reg(SPI_PIN_REG(_spi_port));
       auto cmd_reg = _spi_cmd_reg;
       auto value = *pin_reg;
-      *pin_reg = value ^ SPI_CK_IDLE_EDGE;
+      volatile uint32_t* pin_reg_ptr = pin_reg;
+      *pin_reg_ptr = value ^ SPI_CK_IDLE_EDGE;
       *cmd_reg = SPI_UPDATE;
-      *pin_reg = value;
+      *pin_reg_ptr = value;
       *cmd_reg = SPI_UPDATE;
       return;
     }
@@ -872,7 +875,8 @@ label_start:
   {
     set_read_len(bit_length);
     auto spi_cmd_reg = _spi_cmd_reg;
-    *spi_cmd_reg = SPI_EXECUTE;
+    volatile uint32_t* spi_cmd_reg_ptr = spi_cmd_reg;
+    *spi_cmd_reg_ptr = SPI_EXECUTE;
     auto spi_w0_reg = _spi_w0_reg;
     uint32_t mask = (32 > bit_length) ? ~getSwap32((1 << (32 - bit_length))-1) : ~0;
     while (*spi_cmd_reg & SPI_USR);
@@ -1079,6 +1083,18 @@ label_start:
     *(uint32_t*)dmadesc = ((len + 3) & ( ~3 )) | len << 12 | 0xC0000000;
     dmadesc->buf = (uint8_t *)data;
     dmadesc->qe.stqe_next = nullptr;
+  }
+
+  void Bus_SPI::set_write_len(uint32_t bitlen)
+  {
+    volatile uint32_t* spi_mosi_dlen_reg_ptr = reg(SPI_MOSI_DLEN_REG(_spi_port));
+    *spi_mosi_dlen_reg_ptr = bitlen - 1;
+  }
+
+  __attribute__ ((always_inline)) inline void Bus_SPI::set_read_len( uint32_t bitlen)
+  {
+    volatile uint32_t* spi_miso_dlen_reg_ptr = reg(SPI_MISO_DLEN_REG(_spi_port));
+    *spi_miso_dlen_reg_ptr = bitlen - 1;
   }
 
 //----------------------------------------------------------------------------

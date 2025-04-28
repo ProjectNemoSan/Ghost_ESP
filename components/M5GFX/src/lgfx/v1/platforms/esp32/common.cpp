@@ -590,10 +590,13 @@ namespace lgfx
         }
       }
 
-      *reg(SPI_USER_REG(spi_port)) = SPI_USR_MOSI | SPI_USR_MISO | SPI_DOUTDIN;  // need SD card access (full duplex setting)
-      *reg(SPI_CTRL_REG(spi_port)) = 0;
+      volatile uint32_t* spi_user_reg_ptr = reg(SPI_USER_REG(spi_port));
+      *spi_user_reg_ptr = SPI_USR_MOSI | SPI_USR_MISO | SPI_DOUTDIN;  // need SD card access (full duplex setting)
+      volatile uint32_t* spi_ctrl_reg_ptr = reg(SPI_CTRL_REG(spi_port));
+      *spi_ctrl_reg_ptr = 0;
 #if defined ( SPI_CTRL1_REG )
-      *reg(SPI_CTRL1_REG(spi_port)) = 0;
+      volatile uint32_t* spi_ctrl1_reg_ptr = reg(SPI_CTRL1_REG(spi_port));
+      *spi_ctrl1_reg_ptr = 0;
 #endif
 #if defined ( SPI_CTRL2_REG )
       *reg(SPI_CTRL2_REG(spi_port)) = 0;
@@ -675,13 +678,17 @@ namespace lgfx
 
       beginTransaction(spi_host);
 
-      *reg(SPI_USER_REG(spi_port)) = user;
+      volatile uint32_t* spi_user_reg_ptr = reg(SPI_USER_REG(spi_port));
+      *spi_user_reg_ptr = user;
 #if defined (SPI_PIN_REG)
-      *reg(SPI_PIN_REG(spi_port)) = pin;
+      volatile uint32_t* spi_pin_reg_ptr = reg(SPI_PIN_REG(spi_port));
+      *spi_pin_reg_ptr = pin;
 #else
-      *reg(SPI_MISC_REG( spi_port)) = pin;
+      volatile uint32_t* spi_misc_reg_ptr = reg(SPI_MISC_REG( spi_port));
+      *spi_misc_reg_ptr = pin;
 #endif
-      *reg(SPI_CLOCK_REG(spi_port)) = clkdiv;
+      volatile uint32_t* spi_clock_reg_ptr = reg(SPI_CLOCK_REG(spi_port));
+      *spi_clock_reg_ptr = clkdiv;
 
 #if defined ( SPI_UPDATE )
       *reg(SPI_CMD_REG(spi_port)) = SPI_UPDATE;
@@ -711,9 +718,12 @@ namespace lgfx
       (void)spi_port;
       if (len > 64) len = 64;
       memcpy(reinterpret_cast<void*>(SPI_W0_REG(spi_port)), data, (len + 3) & ~3);
-      *reg(SPI_MOSI_DLEN_REG(spi_port)) = (len << 3) - 1;
-      *reg(SPI_CMD_REG(      spi_port)) = SPI_EXECUTE;
-      while (*reg(SPI_CMD_REG(spi_port)) & SPI_USR);
+      volatile uint32_t* spi_mosi_dlen_reg_ptr = reg(SPI_MOSI_DLEN_REG(spi_port));
+      *spi_mosi_dlen_reg_ptr = (len << 3) - 1;
+      volatile uint32_t* spi_cmd_reg_ptr = reg(SPI_CMD_REG(      spi_port));
+      *spi_cmd_reg_ptr = SPI_EXECUTE;
+      volatile uint32_t* spi_cmd_reg_ptr_wait = reg(SPI_CMD_REG(spi_port));
+      while (*spi_cmd_reg_ptr_wait & SPI_USR);
     }
 
     void readBytes(int spi_host, uint8_t* data, size_t len)
@@ -722,9 +732,12 @@ namespace lgfx
       (void)spi_port;
       if (len > 64) len = 64;
       memcpy(reinterpret_cast<void*>(SPI_W0_REG(spi_port)), data, (len + 3) & ~3);
-      *reg(SPI_MOSI_DLEN_REG(spi_port)) = (len << 3) - 1;
-      *reg(SPI_CMD_REG(      spi_port)) = SPI_EXECUTE;
-      while (*reg(SPI_CMD_REG(spi_port)) & SPI_USR);
+      volatile uint32_t* spi_mosi_dlen_reg_ptr = reg(SPI_MOSI_DLEN_REG(spi_port));
+      *spi_mosi_dlen_reg_ptr = (len << 3) - 1;
+      volatile uint32_t* spi_cmd_reg_ptr = reg(SPI_CMD_REG(      spi_port));
+      *spi_cmd_reg_ptr = SPI_EXECUTE;
+      volatile uint32_t* spi_cmd_reg_ptr_wait = reg(SPI_CMD_REG(spi_port));
+      while (*spi_cmd_reg_ptr_wait & SPI_USR);
 
       memcpy(data, reinterpret_cast<const void*>(SPI_W0_REG(spi_port)), len);
     }
