@@ -1,5 +1,13 @@
 # Ghost ESP Changelog
 
+## Revival v1.7.1
+
+- Fix for RGB not properly being handled on devices with no LEDs
+- Possible fix for captive portal not being effective on some devices
+- Apply existing wroom display memory optimizations to c5
+- Fix incorrect usage of mDNS
+- Update setcountry command on the C5 to use the official esp_wifi_set_country_code function
+
 ## Revival v1.7
 
 ### Major Updates
