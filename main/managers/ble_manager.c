@@ -9,9 +9,11 @@
 #include "esp_random.h"
 #include "host/ble_gap.h"
 #include "host/ble_hs.h"
+#include "host/ble_sm.h"
 #include "host/util/util.h"
 #include "managers/ble_manager.h"
 #include "managers/views/terminal_screen.h"
+#include "core/glog.h"
 #include "nimble/ble.h"
 #include "nimble/nimble_port.h"
 #include "nimble/nimble_port_freertos.h"
@@ -19,6 +21,8 @@
 #include <esp_mac.h>
 #include <managers/rgb_manager.h>
 #include <managers/settings_manager.h>
+#include "managers/status_display_manager.h"
+#include "esp_bt.h"
 
 #define MAX_DEVICES 30
 #define MAX_HANDLERS 10
@@ -40,6 +44,8 @@ static int airTagCount = 0;
 static bool ble_initialized = false;
 static esp_timer_handle_t flush_timer = NULL;
 static TaskHandle_t nimble_host_task_handle = NULL;
+static uint32_t ble_pcap_packet_count = 0;
+static uint32_t ble_pcap_event_total_count = 0;
 
 // Forward declarations
 static void generate_random_mac(uint8_t *mac_addr);
@@ -66,7 +72,8 @@ static int selected_airtag_index = -1; // Index of the AirTag selected for spoof
 static ble_handler_t *handlers = NULL;
 static int handler_count = 0;
 static int spam_counter = 0;
-static uint16_t *last_company_id = NULL;
+static bool last_company_id_valid = false;
+static uint16_t last_company_id_value = 0;
 static TickType_t last_detection_time = 0;
 static void ble_pcap_callback(struct ble_gap_event *event, size_t len);
 
@@ -689,6 +696,8 @@ static void notify_handlers(struct ble_gap_event *event, int len) {
 void nimble_host_task(void *param) {
     nimble_port_run();
     nimble_port_freertos_deinit();
+    // Ensure the task fully exits to avoid lingering stack usage
+    vTaskDelete(NULL);
 }
 
 static int8_t generate_random_rssi() { return (esp_random() % 121) - 100; }
@@ -776,14 +785,23 @@ static void restart_ble_stack(void) {
     // Small delay before reinitializing
     vTaskDelay(pdMS_TO_TICKS(50));
     
+    // log DMA-capable internal heap info right before NimBLE re-init
+    size_t free_internal_dma_re = heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT | MALLOC_CAP_DMA);
+    size_t largest_internal_dma_re = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT | MALLOC_CAP_DMA);
+    ESP_LOGI(TAG_BLE, "reinit pre-init dma-ram: free=%d bytes (largest block=%d)", (int)free_internal_dma_re, (int)largest_internal_dma_re);
+    TERMINAL_VIEW_ADD_TEXT("reinit pre-init dma-ram: free=%d bytes (largest=%d)\n", (int)free_internal_dma_re, (int)largest_internal_dma_re);
+
     // Reinitialize the NimBLE stack
     int ret = nimble_port_init();
     if (ret != 0) {
         ESP_LOGE(TAG_BLE, "Failed to reinit nimble port: %d", ret);
+        size_t free_dma_after_re = heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT | MALLOC_CAP_DMA);
+        size_t largest_dma_after_re = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT | MALLOC_CAP_DMA);
+        ESP_LOGI(TAG_BLE, "reinit post-fail dma-ram: free=%d bytes (largest block=%d)", (int)free_dma_after_re, (int)largest_dma_after_re);
         return;
     }
     
-    // Restart the NimBLE host task
+    // Restart the NimBLE host task (larger stack)
     xTaskCreate(nimble_host_task, "nimble_host", 4096, NULL, 5, &nimble_host_task_handle);
     
     // Wait for NimBLE stack to be ready
@@ -839,19 +857,31 @@ static bool extract_company_id(const uint8_t *payload, size_t length, uint16_t *
 }
 
 void ble_stop_skimmer_detection(void) {
-    ESP_LOGI("BLE", "Stopping skimmer detection scan...");
-    TERMINAL_VIEW_ADD_TEXT("Stopping skimmer detection scan...\n");
+    glog("Stopping skimmer detection scan...\n");
+    status_display_show_status("Skimmer Stopping");
 
     // Unregister the skimmer detection callback
     ble_unregister_handler(ble_skimmer_scan_callback);
     pcap_flush_buffer_to_file(); // Final flush
     pcap_file_close();           // Close the file after final flush
 
+    /* final capture summary */
+    glog("BLE capture summary: captured=%lu filtered=%lu total=%lu\n",
+         (unsigned long)ble_pcap_packet_count,
+         (unsigned long)((ble_pcap_event_total_count > ble_pcap_packet_count) ? (ble_pcap_event_total_count - ble_pcap_packet_count) : 0),
+         (unsigned long)ble_pcap_event_total_count);
+    /* reset counters for next capture */
+    ble_pcap_packet_count = 0;
+    ble_pcap_event_total_count = 0;
+
     int rc = ble_gap_disc_cancel();
 
     if (rc == 0) {
-        printf("BLE skimmer detection stopped successfully.\n");
-        TERMINAL_VIEW_ADD_TEXT("BLE skimmer detection stopped successfully.\n");
+        glog("BLE skimmer detection stopped successfully.\n");
+        status_display_show_status("Skimmer Stopped");
+    } else {
+        glog("Error stopping BLE skimmer detection: %d\n", rc);
+        status_display_show_status("Skimmer Stop Fail");
     }
 }
 
@@ -929,11 +959,78 @@ static void parse_service_uuids(const uint8_t *data, uint8_t data_len, ble_servi
     }
 }
 
+static int handle_passkey_action(struct ble_gap_event *event) {
+    if (event->type != BLE_GAP_EVENT_PASSKEY_ACTION) {
+        return 0;
+    }
+
+    ESP_LOGI(TAG_BLE, "Passkey action required: %d", event->passkey.params.action);
+    
+    if (event->passkey.params.action == BLE_SM_IOACT_INPUT) {
+        // Device is requesting PIN input
+        ESP_LOGI(TAG_BLE, "PIN input required for connection %d", event->passkey.conn_handle);
+        
+        // Check if we have a PIN stored for Chameleon Ultra
+        #ifdef CONFIG_NFC_CHAMELEON
+        extern char g_chameleon_pin[];
+        extern bool g_pin_required;
+        
+        if (g_pin_required && strlen(g_chameleon_pin) > 0) {
+            ESP_LOGI(TAG_BLE, "Providing PIN for authentication");
+            printf("Providing PIN for Chameleon Ultra authentication...\n");
+            TERMINAL_VIEW_ADD_TEXT("Providing PIN for authentication...\n");
+
+            // Convert PIN string to uint32_t for the passkey field
+            uint32_t passkey = 0;
+            int pin_len = strlen(g_chameleon_pin);
+            for (int i = 0; i < pin_len && i < 6; i++) {
+                passkey = passkey * 10 + (g_chameleon_pin[i] - '0');
+            }
+
+            // Create the IO structure with the passkey
+            struct ble_sm_io io_data = {
+                .action = BLE_SM_IOACT_INPUT,
+                .passkey = passkey
+            };
+
+            // Provide the PIN to the security manager
+            int rc = ble_sm_inject_io(event->passkey.conn_handle, &io_data);
+            if (rc != 0) {
+                ESP_LOGE(TAG_BLE, "Failed to inject PIN: %d", rc);
+                printf("Failed to provide PIN for authentication\n");
+                TERMINAL_VIEW_ADD_TEXT("Failed to provide PIN\n");
+                return -1;
+            }
+
+            ESP_LOGI(TAG_BLE, "PIN provided successfully");
+            return 0;
+        } else {
+            ESP_LOGW(TAG_BLE, "PIN required but not set");
+            printf("PIN required but not provided\n");
+            TERMINAL_VIEW_ADD_TEXT("PIN required but not provided\n");
+            return -1;
+        }
+        #else
+        ESP_LOGW(TAG_BLE, "PIN input requested but NFC Chameleon is disabled");
+        return -1;
+        #endif
+    } else if (event->passkey.params.action == BLE_SM_IOACT_DISP) {
+        // Device is displaying a PIN (we don't need to handle this for Chameleon Ultra)
+        ESP_LOGI(TAG_BLE, "Device displaying PIN (not needed for Chameleon Ultra)");
+        return 0;
+    }
+
+    return 0;
+}
+
 static int ble_gap_event_general(struct ble_gap_event *event, void *arg) {
     switch (event->type) {
     case BLE_GAP_EVENT_DISC:
         notify_handlers(event, event->disc.length_data);
+        break;
 
+    case BLE_GAP_EVENT_PASSKEY_ACTION:
+        handle_passkey_action(event);
         break;
 
     default:
@@ -1068,7 +1165,7 @@ void detect_ble_spam_callback(struct ble_gap_event *event, size_t length) {
         spam_counter = 0;
     }
 
-    if (last_company_id != NULL && *last_company_id == current_company_id) {
+    if (last_company_id_valid && last_company_id_value == current_company_id) {
         spam_counter++;
 
         if (spam_counter > MAX_PAYLOADS) {
@@ -1079,14 +1176,9 @@ void detect_ble_spam_callback(struct ble_gap_event *event, size_t length) {
             spam_counter = 0;
         }
     } else {
-        if (last_company_id == NULL) {
-            last_company_id = (uint16_t *)malloc(sizeof(uint16_t));
-        }
-
-        if (last_company_id != NULL) {
-            *last_company_id = current_company_id;
-            spam_counter = 1;
-        }
+        last_company_id_value = current_company_id;
+        last_company_id_valid = true;
+        spam_counter = 1;
     }
 
     last_detection_time = current_time;
@@ -1148,21 +1240,15 @@ void airtag_scanner_callback(struct ble_gap_event *event, size_t len) {
                      event->disc.addr.val[3], event->disc.addr.val[4], event->disc.addr.val[5]);
             int rssi = event->disc.rssi;
 
-                printf("New AirTag found! (Total: %d)\n", airTagCount);
-                printf("Index: %d\n", discovered_airtag_count - 1); // Index of the newly added tag
-            printf("MAC Address: %s\n", macAddress);
-            printf("RSSI: %d dBm\n", rssi);
-            printf("Payload Data: ");
-            for (size_t i = 0; i < payloadLength; i++) {
-                printf("%02X ", payload[i]);
-            }
-            printf("\n\n");
-
-                TERMINAL_VIEW_ADD_TEXT("New AirTag found! (Total: %d)\n", airTagCount);
-                TERMINAL_VIEW_ADD_TEXT("Index: %d\n", discovered_airtag_count - 1);
-            TERMINAL_VIEW_ADD_TEXT("MAC Address: %s\n", macAddress);
-            TERMINAL_VIEW_ADD_TEXT("RSSI: %d dBm\n", rssi);
-                TERMINAL_VIEW_ADD_TEXT("\n");
+                glog("New AirTag found! (Total: %d)\n", airTagCount);
+                glog("Index: %d\n", discovered_airtag_count - 1); // Index of the newly added tag
+                glog("MAC Address: %s\n", macAddress);
+                glog("RSSI: %d dBm\n", rssi);
+                glog("Payload Data: ");
+                for (size_t i = 0; i < payloadLength; i++) {
+                    glog("%02X ", payload[i]);
+                }
+                glog("\n\n");
             }
         }
     }
@@ -1170,11 +1256,9 @@ void airtag_scanner_callback(struct ble_gap_event *event, size_t len) {
 
 // Function to list discovered AirTags
 void ble_list_airtags(void) {
-    printf("--- Discovered AirTags (%d) ---\n", discovered_airtag_count);
-    TERMINAL_VIEW_ADD_TEXT("--- Discovered AirTags (%d) ---\n", discovered_airtag_count);
+    glog("--- Discovered AirTags (%d) ---\n", discovered_airtag_count);
     if (discovered_airtag_count == 0) {
-        printf("No AirTags discovered yet.\n");
-        TERMINAL_VIEW_ADD_TEXT("No AirTags discovered yet.\n");
+        glog("No AirTags discovered yet.\n");
         return;
     }
 
@@ -1184,12 +1268,9 @@ void ble_list_airtags(void) {
                  discovered_airtags[i].addr.val[0], discovered_airtags[i].addr.val[1], discovered_airtags[i].addr.val[2],
                  discovered_airtags[i].addr.val[3], discovered_airtags[i].addr.val[4], discovered_airtags[i].addr.val[5]);
 
-        printf("Index: %d | MAC: %s | RSSI: %d dBm %s\n",
-               i, macAddress, discovered_airtags[i].rssi,
-               (i == selected_airtag_index) ? " (Selected)" : "");
-        TERMINAL_VIEW_ADD_TEXT("Idx: %d MAC: %s RSSI: %d %s\n",
-                               i, macAddress, discovered_airtags[i].rssi,
-                               (i == selected_airtag_index) ? "(Sel)" : "");
+        glog("Index: %d | MAC: %s | RSSI: %d dBm %s\n",
+             i, macAddress, discovered_airtags[i].rssi,
+             (i == selected_airtag_index) ? " (Selected)" : "");
         // Optionally print payload too
         // printf("  Payload (%zu bytes): ", discovered_airtags[i].payload_len);
         // for(size_t j = 0; j < discovered_airtags[i].payload_len; j++) {
@@ -1197,15 +1278,13 @@ void ble_list_airtags(void) {
         // }
         // printf("\n");
     }
-    printf("-----------------------------\n");
-    TERMINAL_VIEW_ADD_TEXT("-----------------------------\n");
+    glog("-----------------------------\n");
 }
 
 // Function to select an AirTag by index
 void ble_select_airtag(int index) {
     if (index < 0 || index >= discovered_airtag_count) {
-        printf("Error: Invalid AirTag index %d. Use 'listairtags' to see valid indices.\n", index);
-        TERMINAL_VIEW_ADD_TEXT("Error: Invalid AirTag index %d.\nUse 'listairtags'.\n", index);
+        glog("Error: Invalid AirTag index %d. Use 'listairtags' to see valid indices.\n", index);
         selected_airtag_index = -1; // Unselect if index is invalid
         return;
     }
@@ -1215,15 +1294,13 @@ void ble_select_airtag(int index) {
     snprintf(macAddress, sizeof(macAddress), "%02x:%02x:%02x:%02x:%02x:%02x",
              discovered_airtags[index].addr.val[0], discovered_airtags[index].addr.val[1], discovered_airtags[index].addr.val[2],
              discovered_airtags[index].addr.val[3], discovered_airtags[index].addr.val[4], discovered_airtags[index].addr.val[5]);
-    printf("Selected AirTag at index %d: MAC %s\n", index, macAddress);
-    TERMINAL_VIEW_ADD_TEXT("Selected AirTag %d: MAC %s\n", index, macAddress);
+    glog("Selected AirTag at index %d: MAC %s\n", index, macAddress);
 }
 
 // Function to start spoofing the selected AirTag (Basic Implementation)
 void ble_start_spoofing_selected_airtag(void) {
     if (selected_airtag_index < 0 || selected_airtag_index >= discovered_airtag_count) {
-        printf("Error: No AirTag selected for spoofing. Use 'selectairtag <index>'.\n");
-        TERMINAL_VIEW_ADD_TEXT("Error: No AirTag selected.\nUse 'selectairtag <index>'.\n");
+        glog("Error: No AirTag selected for spoofing. Use 'selectairtag <index>'.\n");
         return;
     }
 
@@ -1243,18 +1320,6 @@ void ble_start_spoofing_selected_airtag(void) {
     // Set flags (General Discoverable Mode, BR/EDR Not Supported) - typical for BLE beacons
     fields.flags = BLE_HS_ADV_F_DISC_GEN | BLE_HS_ADV_F_BREDR_UNSUP;
 
-    // Set the manufacturer data using the captured payload
-    // The AirTag payload IS the manufacturer data for Company ID 0x004C (Apple)
-    // We need to ensure the payload structure is correct for advertising.
-    // Usually, it starts with Length, Type (0xFF), Company ID (2 bytes), then data.
-    // We might need to slightly adjust the stored payload if it doesn't include the Length/Type/CompanyID header.
-    // Assuming tag_to_spoof->payload contains the complete Manufacturer Specific Data field content
-    // starting *after* the Company ID. Let's verify the actual AirTag payload structure.
-    // Looking at the detection pattern:
-    // 1E FF 4C 00 ... (Nearby) -> Length=0x1E, Type=0xFF, Company=0x004C
-    // 4C 00 12 19 ... (Offline Finding) -> This seems *part* of the Apple data, maybe not the whole adv packet?
-    // Need to confirm the *entire* advertisement structure.
-    // For simplicity, let's assume tag_to_spoof->payload contains the data *after* Company ID.
 
     // Find the start of the Apple Manufacturer Data (0xFF) in the payload
     uint8_t *mfg_data_start = NULL;
@@ -1262,6 +1327,7 @@ void ble_start_spoofing_selected_airtag(void) {
     size_t current_index = 0;
     while (current_index < tag_to_spoof->payload_len) {
         uint8_t field_len = tag_to_spoof->payload[current_index];
+
         if (field_len == 0 || current_index + field_len >= tag_to_spoof->payload_len) break;
         uint8_t field_type = tag_to_spoof->payload[current_index + 1];
         if (field_type == 0xFF && field_len >= 3) { // Manufacturer Specific Data
@@ -1276,8 +1342,7 @@ void ble_start_spoofing_selected_airtag(void) {
         if (tag_to_spoof->payload_len > 2) {
             fields.mfg_data = &tag_to_spoof->payload[2];
             fields.mfg_data_len = tag_to_spoof->payload_len - 2;
-            printf("Warning: Using raw payload data for advertisement.\n");
-            TERMINAL_VIEW_ADD_TEXT("Warn: Using raw payload for adv.\n");
+            glog("Warning: Using raw payload data for advertisement.\n");
          } else {
              return; // No data to advertise
          }
@@ -1491,6 +1556,7 @@ void ble_start_spoofing_selected_airtag(void) {
              tag_to_spoof->addr.val[3], tag_to_spoof->addr.val[4], tag_to_spoof->addr.val[5]);
     printf("Started spoofing AirTag %d (MAC: %s)\n", selected_airtag_index, macAddress);
     TERMINAL_VIEW_ADD_TEXT("Started spoofing AirTag %d\nMAC: %s\n", selected_airtag_index, macAddress);
+    status_display_show_status("AirTag Spoof On");
     // Pulse green maybe?
     pulse_once(&rgb_manager, 0, 255, 0);
 }
@@ -1500,17 +1566,18 @@ void ble_stop_spoofing(void) {
     if (ble_gap_adv_active()) {
         int rc = ble_gap_adv_stop();
         if (rc == 0) {
-            printf("Stopped AirTag spoofing advertisement.\n");
-            TERMINAL_VIEW_ADD_TEXT("Stopped AirTag spoofing.\n");
+            glog("Stopped AirTag spoofing advertisement.\n");
+            status_display_show_status("AirTag Spoof Off");
         } else {
             ESP_LOGE(TAG_BLE, "Error stopping spoofing advertisement; rc=%d", rc);
-            TERMINAL_VIEW_ADD_TEXT("Error stopping spoof adv; rc=%d\n", rc);
+            glog("Error stopping spoof adv; rc=%d\n", rc);
+            status_display_show_status("Spoof Stop Fail");
         }
         // Reset selected index after stopping spoof
         selected_airtag_index = -1;
     } else {
-        printf("No spoofing advertisement active.\n");
-        TERMINAL_VIEW_ADD_TEXT("No spoofing adv active.\n");
+        glog("No spoofing advertisement active.\n");
+        status_display_show_status("No Spoof Active");
     }
 }
 
@@ -1547,13 +1614,14 @@ void ble_start_scanning(void) {
     if (!wait_for_ble_ready()) {
         ESP_LOGE(TAG_BLE, "BLE stack not ready");
         TERMINAL_VIEW_ADD_TEXT("BLE stack not ready\n");
+        status_display_show_status("BLE Not Ready");
         return;
     }
 
     struct ble_gap_disc_params disc_params = {0};
     disc_params.itvl = BLE_HCI_SCAN_ITVL_DEF;
     disc_params.window = BLE_HCI_SCAN_WINDOW_DEF;
-    disc_params.filter_duplicates = 1;
+    disc_params.filter_duplicates = 0;
 
     // Start a new BLE scan
     int rc = ble_gap_disc(BLE_OWN_ADDR_PUBLIC, BLE_HS_FOREVER, &disc_params, ble_gap_event_general,
@@ -1561,28 +1629,24 @@ void ble_start_scanning(void) {
     if (rc != 0) {
         ESP_LOGE(TAG_BLE, "Error starting BLE scan");
         TERMINAL_VIEW_ADD_TEXT("Error starting BLE scan\n");
+        status_display_show_status("BLE Scan Fail");
     } else {
         ESP_LOGI(TAG_BLE, "Scanning started...");
         TERMINAL_VIEW_ADD_TEXT("Scanning started...\n");
+        status_display_show_status("BLE Scanning");
     }
 }
 
 esp_err_t ble_register_handler(ble_data_handler_t handler) {
-    if (handler_count < MAX_HANDLERS) {
-        ble_handler_t *new_handlers =
-            realloc(handlers, (handler_count + 1) * sizeof(ble_handler_t));
-        if (!new_handlers) {
-            ESP_LOGE(TAG_BLE, "Failed to allocate memory for handlers");
-            return ESP_ERR_NO_MEM;
-        }
-
-        handlers = new_handlers;
-        handlers[handler_count].handler = handler;
-        handler_count++;
-        return ESP_OK;
+    if (!handlers) {
+        return ESP_ERR_INVALID_STATE;
     }
-
-    return ESP_ERR_NO_MEM;
+    if (handler_count >= MAX_HANDLERS) {
+        return ESP_ERR_NO_MEM;
+    }
+    handlers[handler_count].handler = handler;
+    handler_count++;
+    return ESP_OK;
 }
 
 esp_err_t ble_unregister_handler(ble_data_handler_t handler) {
@@ -1591,12 +1655,7 @@ esp_err_t ble_unregister_handler(ble_data_handler_t handler) {
             for (int j = i; j < handler_count - 1; j++) {
                 handlers[j] = handlers[j + 1];
             }
-
             handler_count--;
-            ble_handler_t *new_handlers = realloc(handlers, handler_count * sizeof(ble_handler_t));
-            if (new_handlers || handler_count == 0) {
-                handlers = new_handlers;
-            }
             return ESP_OK;
         }
     }
@@ -1606,6 +1665,24 @@ esp_err_t ble_unregister_handler(ble_data_handler_t handler) {
 
 void ble_init(void) {
 #ifndef CONFIG_IDF_TARGET_ESP32S2
+    // --- pre-init ram check ---
+    size_t free_internal = heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    size_t largest_internal = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    size_t free_psram = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
+    size_t largest_psram = heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM);
+    
+    if (free_psram > 0) {
+        ESP_LOGI(TAG_BLE, "pre-init ram: internal=%d bytes (largest block=%d), psram=%d bytes (largest block=%d)", 
+                 (int)free_internal, (int)largest_internal, (int)free_psram, (int)largest_psram);
+        TERMINAL_VIEW_ADD_TEXT("pre-init ram: internal=%d bytes (largest=%d), psram=%d bytes (largest=%d)\n", 
+                               (int)free_internal, (int)largest_internal, (int)free_psram, (int)largest_psram);
+    } else {
+        ESP_LOGI(TAG_BLE, "pre-init ram: internal=%d bytes (largest block=%d), no psram", 
+                 (int)free_internal, (int)largest_internal);
+        TERMINAL_VIEW_ADD_TEXT("pre-init ram: internal=%d bytes (largest=%d), no psram\n", 
+                               (int)free_internal, (int)largest_internal);
+    }
+    
     // --- Memory check before BLE init ---
     size_t free_heap = heap_caps_get_free_size(MALLOC_CAP_8BIT);
     if (free_heap < (45 * 1024)) {
@@ -1632,16 +1709,30 @@ void ble_init(void) {
             handler_count = 0;
         }
 
+        // Release Classic BT controller memory on non-ESP32 targets too to free RAM for NimBLE
+        // Safe to call multiple times; ignore return if already released
+        (void)esp_bt_controller_mem_release(ESP_BT_MODE_CLASSIC_BT);
+
+        // log DMA-capable internal heap info right before NimBLE init
+        size_t free_internal_dma = heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT | MALLOC_CAP_DMA);
+        size_t largest_internal_dma = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT | MALLOC_CAP_DMA);
+        ESP_LOGI(TAG_BLE, "pre-init dma-ram: free=%d bytes (largest block=%d)", (int)free_internal_dma, (int)largest_internal_dma);
+        TERMINAL_VIEW_ADD_TEXT("pre-init dma-ram: free=%d bytes (largest=%d)\n", (int)free_internal_dma, (int)largest_internal_dma);
+
         ret = nimble_port_init();
         if (ret != 0) {
             ESP_LOGE(TAG_BLE, "Failed to init nimble port: %d", ret);
+            ESP_LOGI(TAG_BLE, "Dumping DMA-capable heap info after failure");
+            size_t free_dma_after = heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT | MALLOC_CAP_DMA);
+            size_t largest_dma_after = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT | MALLOC_CAP_DMA);
+            ESP_LOGI(TAG_BLE, "post-fail dma-ram: free=%d bytes (largest block=%d)", (int)free_dma_after, (int)largest_dma_after);
             free(handlers);
             handlers = NULL;
             return;
         }
 
-        // Configure and start the NimBLE host task
-        xTaskCreate(nimble_host_task, "nimble_host", 4096, NULL, 5, &nimble_host_task_handle);
+        // Configure and start the NimBLE host task (larger stack to avoid overflow on S3)
+        xTaskCreate(nimble_host_task, "nimble_host", 6144, NULL, 5, &nimble_host_task_handle);
         
         // Wait for NimBLE stack to be ready
         vTaskDelay(pdMS_TO_TICKS(100));
@@ -1674,15 +1765,25 @@ void ble_deinit(void) {
             handler_count = 0;
         }
 
+        // Stop NimBLE host and wait for the host task to exit
         nimble_port_stop();
-        nimble_port_deinit();
-        
-        // Wait for nimble host task to finish and clean up
         if (nimble_host_task_handle != NULL) {
-            vTaskDelay(pdMS_TO_TICKS(100));
+            int wait_iterations = 0;
+            // Give the host task time to exit gracefully
+            while (eTaskGetState(nimble_host_task_handle) != eDeleted && wait_iterations < 25) {
+                vTaskDelay(pdMS_TO_TICKS(20));
+                wait_iterations++;
+            }
+            // If it still hasn't exited, force-delete it
+            if (eTaskGetState(nimble_host_task_handle) != eDeleted) {
+                vTaskDelete(nimble_host_task_handle);
+                vTaskDelay(pdMS_TO_TICKS(10));
+            }
             nimble_host_task_handle = NULL;
         }
-        
+        // Now deinitialize the NimBLE port (controller + host deinit)
+        nimble_port_deinit();
+
         ble_initialized = false;
         ESP_LOGI(TAG_BLE, "BLE deinitialized successfully.");
         TERMINAL_VIEW_ADD_TEXT("BLE deinitialized successfully.\n");
@@ -1698,10 +1799,9 @@ void ble_stop(void) {
         return;
     }
 
-    if (last_company_id != NULL) {
-        free(last_company_id);
-        last_company_id = NULL;
-    }
+    status_display_show_status("BLE Stopping");
+
+    last_company_id_valid = false;
 
     // Stop and delete the flush timer if it exists
     if (flush_timer != NULL) {
@@ -1718,6 +1818,15 @@ void ble_stop(void) {
     pcap_flush_buffer_to_file(); // Final flush
     pcap_file_close();           // Close the file after final flush
 
+    /* final capture summary */
+    glog("BLE capture summary: captured=%lu filtered=%lu total=%lu\n",
+         (unsigned long)ble_pcap_packet_count,
+         (unsigned long)((ble_pcap_event_total_count > ble_pcap_packet_count) ? (ble_pcap_event_total_count - ble_pcap_packet_count) : 0),
+         (unsigned long)ble_pcap_event_total_count);
+    /* reset counters for next capture */
+    ble_pcap_packet_count = 0;
+    ble_pcap_event_total_count = 0;
+
     // Stop spoofing if it was active
     ble_stop_spoofing();
 
@@ -1725,28 +1834,28 @@ void ble_stop(void) {
 
     switch (rc) {
     case 0:
-        printf("BLE scan stopped successfully.\n");
-        TERMINAL_VIEW_ADD_TEXT("BLE scan stopped successfully.\n");
+        glog("BLE scan stopped successfully.\n");
+        status_display_show_status("BLE Stopped");
         break;
     case BLE_HS_EBUSY:
-        printf("BLE scan is busy\n");
-        TERMINAL_VIEW_ADD_TEXT("BLE scan is busy\n");
+        glog("BLE scan is busy\n");
+        status_display_show_status("BLE Busy");
         break;
     case BLE_HS_ETIMEOUT:
-        printf("BLE operation timed out.\n");
-        TERMINAL_VIEW_ADD_TEXT("BLE operation timed out.\n");
+        glog("BLE operation timed out.\n");
+        status_display_show_status("BLE Timeout");
         break;
     case BLE_HS_ENOTCONN:
-        printf("BLE not connected.\n");
-        TERMINAL_VIEW_ADD_TEXT("BLE not connected.\n");
+        glog("BLE not connected.\n");
+        status_display_show_status("BLE No Conn");
         break;
     case BLE_HS_EINVAL:
-        printf("BLE invalid parameter.\n");
-        TERMINAL_VIEW_ADD_TEXT("BLE invalid parameter.\n");
+        glog("BLE invalid parameter.\n");
+        status_display_show_status("BLE Invalid");
         break;
     default:
-        printf("Error stopping BLE scan: %d\n", rc);
-        TERMINAL_VIEW_ADD_TEXT("Error stopping BLE scan: %d\n", rc);
+        glog("Error stopping BLE scan: %d\n", rc);
+        status_display_show_status("BLE Stop Fail");
     }
 }
 
@@ -1795,6 +1904,9 @@ static void ble_pcap_callback(struct ble_gap_event *event, size_t len) {
     if (!event || len == 0)
         return;
 
+    /* count every callback event we receive for filtering stats */
+    ble_pcap_event_total_count++;
+
     uint8_t hci_buffer[258]; // Max HCI packet size
     size_t hci_len = 0;
 
@@ -1838,50 +1950,36 @@ static void ble_pcap_callback(struct ble_gap_event *event, size_t len) {
 
         hci_len = 15 + event->disc.length_data; // Total length
 
-        // packet logging (don't print to display terminal to prevent overwhelming)
-        printf("BLE Packet Received:\nType: 0x04 (HCI Event)\nMeta: 0x3E "
-               "(LE)\nLength: %d\n",
-               hci_len);
+        /* keep a lightweight counter and occasionally report a summary */
+
+        ble_pcap_packet_count++;
+        if ((ble_pcap_packet_count % 50) == 0) {
+            uint32_t filtered = ble_pcap_event_total_count - ble_pcap_packet_count;
+            glog("BLE: %lu packets captured, %lu filtered (total events %lu)\n",
+                 (unsigned long)ble_pcap_packet_count, (unsigned long)filtered, (unsigned long)ble_pcap_event_total_count);
+        }
 
         pcap_write_packet_to_buffer(hci_buffer, hci_len, PCAP_CAPTURE_BLUETOOTH);
-    }
-
-    pcap_flush_buffer_to_file(); // Final flush
-    pcap_file_close();           // Close the file after final flush
-
-    // Stop spoofing if it was active
-    ble_stop_spoofing();
-
-    int rc = ble_gap_disc_cancel();
-
-    switch (rc) {
-    case 0:
-        printf("BLE scan stopped successfully.\n");
-        TERMINAL_VIEW_ADD_TEXT("BLE scan stopped successfully.\n");
-        break;
-    case BLE_HS_EBUSY:
-        printf("BLE scan is busy\n");
-        TERMINAL_VIEW_ADD_TEXT("BLE scan is busy\n");
-        break;
-    case BLE_HS_ETIMEOUT:
-        printf("BLE operation timed out.\n");
-        TERMINAL_VIEW_ADD_TEXT("BLE operation timed out.\n");
-        break;
-    case BLE_HS_ENOTCONN:
-        printf("BLE not connected.\n");
-        TERMINAL_VIEW_ADD_TEXT("BLE not connected.\n");
-        break;
-    case BLE_HS_EINVAL:
-        printf("BLE invalid parameter.\n");
-        TERMINAL_VIEW_ADD_TEXT("BLE invalid parameter.\n");
-        break;
-    default:
-        printf("Error stopping BLE scan: %d\n", rc);
-        TERMINAL_VIEW_ADD_TEXT("Error stopping BLE scan: %d\n", rc);
     }
 }
 
 void ble_start_capture(void) {
+    /* ensure BLE stack is initialized and ready before opening PCAP and
+       starting scanning; avoids leaving a file open if scan fails */
+    if (!ble_initialized) {
+        ble_init();
+    }
+
+    if (!wait_for_ble_ready()) {
+        ESP_LOGE(TAG_BLE, "BLE stack not ready");
+        TERMINAL_VIEW_ADD_TEXT("BLE stack not ready\n");
+        return;
+    }
+
+    /* reset counters for a fresh capture session */
+    ble_pcap_packet_count = 0;
+    ble_pcap_event_total_count = 0;
+
     // Open PCAP file first
     esp_err_t err = pcap_file_open("ble_capture", PCAP_CAPTURE_BLUETOOTH);
     if (err != ESP_OK) {
@@ -1901,6 +1999,7 @@ void ble_start_capture(void) {
     }
 
     ble_start_scanning();
+    status_display_show_status("BLE Capture On");
 }
 
 void ble_start_skimmer_detection(void) {
@@ -1917,26 +2016,21 @@ void ble_start_skimmer_detection(void) {
 
 // Function to list discovered Flippers
 void ble_list_flippers(void) {
-    printf("--- Discovered Flippers (%d) ---\n", discovered_flipper_count);
-    TERMINAL_VIEW_ADD_TEXT("--- Discovered Flippers (%d) ---\n", discovered_flipper_count);
+    glog("--- Discovered Flippers (%d) ---\n", discovered_flipper_count);
     if (discovered_flipper_count == 0) {
-        printf("No Flippers discovered yet.\n");
-        TERMINAL_VIEW_ADD_TEXT("No Flippers discovered yet.\n");
+        glog("No Flippers discovered yet.\n");
         return;
     }
-   
+
     for (int i = 0; i < discovered_flipper_count; i++) {
         char mac[18];
         snprintf(mac, sizeof(mac), "%02x:%02x:%02x:%02x:%02x:%02x",
                  discovered_flippers[i].addr.val[0], discovered_flippers[i].addr.val[1],
                  discovered_flippers[i].addr.val[2], discovered_flippers[i].addr.val[3],
                  discovered_flippers[i].addr.val[4], discovered_flippers[i].addr.val[5]);
-        printf("Index: %d | MAC: %s | RSSI: %d dBm%s\n",
-               i, mac, discovered_flippers[i].rssi,
-               (i == selected_flipper_index) ? " (Selected)" : "");
-        TERMINAL_VIEW_ADD_TEXT("Idx: %d MAC: %s RSSI: %d %s\n",
-                               i, mac, discovered_flippers[i].rssi,
-                               (i == selected_flipper_index) ? "(Sel)" : "");
+        glog("Index: %d | MAC: %s | RSSI: %d dBm%s\n",
+             i, mac, discovered_flippers[i].rssi,
+             (i == selected_flipper_index) ? " (Selected)" : "");
     }
 }
 void ble_start_tracking_selected_flipper(void) {
@@ -1951,16 +2045,14 @@ void ble_start_tracking_selected_flipper(void) {
     params.filter_duplicates = 0; // receive all advertisement updates
     int rc = ble_gap_disc(BLE_OWN_ADDR_PUBLIC, BLE_HS_FOREVER, &params, ble_gap_event_general, NULL);
     if (rc != 0) {
-        ESP_LOGE(TAG_BLE, "Error starting tracking scan; rc=%d", rc);
-        TERMINAL_VIEW_ADD_TEXT("Error starting tracker; rc=%d\n", rc);
+        glog("Error starting tracker; rc=%d\n", rc);
     }
 }
 
 // Function to select a Flipper by index
 void ble_select_flipper(int index) {
     if (index < 0 || index >= discovered_flipper_count) {
-        printf("Error: Invalid Flipper index %d. Use 'listflippers' to see valid indices.\n", index);
-        TERMINAL_VIEW_ADD_TEXT("Error: Invalid Flipper index %d.\nUse 'listflippers'.\n", index);
+        glog("Error: Invalid Flipper index %d. Use 'listflippers' to see valid indices.\n", index);
         selected_flipper_index = -1;
         return;
     }
@@ -1971,12 +2063,10 @@ void ble_select_flipper(int index) {
              discovered_flippers[index].addr.val[0], discovered_flippers[index].addr.val[1],
              discovered_flippers[index].addr.val[2], discovered_flippers[index].addr.val[3],
              discovered_flippers[index].addr.val[4], discovered_flippers[index].addr.val[5]);
-    printf("Selected Flipper at index %d: MAC %s\n", index, mac);
-    TERMINAL_VIEW_ADD_TEXT("Selected Flipper %d: MAC %s\n", index, mac);
+    glog("Selected Flipper at index %d: MAC %s\n", index, mac);
     // Start continuous tracking scan without duplicate filtering
     ble_start_tracking_selected_flipper();
-    printf("Started tracking Flipper %d...\n", index);
-    TERMINAL_VIEW_ADD_TEXT("Track start: Flipper %d\n", index);
+    glog("Started tracking Flipper %d...\n", index);
 }
 
 static void build_microsoft_mfg(const char *name, uint8_t *buf, size_t *len) {
@@ -2108,6 +2198,7 @@ void ble_start_ble_spam(ble_spam_type_t type) {
         case BLE_SPAM_FLIPPERZERO: type_name = "flipper"; break;
     }
     printf("ble spam advertising started (%s)\n", type_name);
+    status_display_show_status("BLE Spam On");
 }
 
 void ble_stop_ble_spam(void) {
@@ -2135,6 +2226,7 @@ void ble_stop_ble_spam(void) {
     }
     
     printf("ble spam advertising stopped\n");
+    status_display_show_status("BLE Spam Off");
 }
 
 #endif

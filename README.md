@@ -14,7 +14,9 @@ Ghost ESP turns your ESP32 into a powerful, cheap and helpful wireless testing t
 
 1. Join our **NEW** community on [Discord](https://discord.gg/5cyNmUMgwh) for support and feedback.
 
-1. Visit our [Official Website](https://ghostesp.net) to stay in touch!
+1. Read the [Documentation](https://docs.ghostesp.net) and visit the [Official Website](https://ghostesp.net) to learn more!
+
+> **Making content about GhostESP?** Check out the [Press Kit](https://github.com/jaylikesbunda/Ghost_ESP/blob/Development-deki/presskit.zip) for resources.
 
 ---
 
@@ -100,6 +102,33 @@ Ghost ESP turns your ESP32 into a powerful, cheap and helpful wireless testing t
 
 
 </details>
+<details>
+<summary>NFC Features</summary>
+
+- **PN532 NFC Capability**
+  - **NTAG Support (Type 2)**
+    - Read NTAG213/215/216 with NDEF parsing
+    - Write NTAG213/215/216 from `.nfc` files
+    - Save to Flipper `.nfc` format
+  - **MIFARE Classic Support (Mini/1K/4K)**
+    - Flipper's 1000+ key dictionary attack
+    - Parse and display NDEF TLV data
+    - Save to Flipper `.nfc` format
+  - **File Management**
+    - 'Saved' menu to browse `.nfc` files and rename/delete them from the UI
+    - 'User Keys' view to list `/mnt/ghostesp/nfc/mfc_user_dict.nfc`
+
+- **Chameleon Ultra Support**
+  - **CLI & UI Integration**
+    - Connect/disconnect and status/battery commands
+  - **Card Support**
+    - NTAG and MIFARE Classic NDEF parsing
+    - Flipper `.nfc` exports via `chameleon savehf/savedump/saventag` and UI
+    - Dictionary attack capability
+
+
+</details>
+
 
 <details>
 
@@ -162,6 +191,8 @@ Ghost ESP turns your ESP32 into a powerful, cheap and helpful wireless testing t
 - AWOK Mini
 
 - M5 Cardputer
+
+- M5 Cardputer ADV
 
 - FlipperHub Rocket
 

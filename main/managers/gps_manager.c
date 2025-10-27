@@ -3,6 +3,7 @@
 #include "driver/periph_ctrl.h"
 #include "driver/uart.h"
 #include "esp_log.h"
+#include "core/glog.h"
 #include "managers/settings_manager.h"
 #include "soc/gpio_periph.h"
 #include "soc/io_mux_reg.h"
@@ -15,6 +16,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include "core/esp_comm_manager.h"
+#include "managers/status_display_manager.h"
 
 static const char *GPS_TAG = "GPS";
 static bool has_valid_cached_date = false;
@@ -55,6 +57,10 @@ static bool is_valid_date(const gps_date_t *date) {
 }
 
 void gps_manager_init(GPSManager *manager) {
+    if (!manager) {
+        ESP_LOGE(GPS_TAG, "NULL manager passed to gps_manager_init");
+        return;
+    }
     // If there's an existing check task, delete it
     if (gps_check_task_handle != NULL) {
         vTaskDelete(gps_check_task_handle);
@@ -79,8 +85,7 @@ void gps_manager_init(GPSManager *manager) {
     current_rx_pin=custom_gps_pin;
     }
 
-    printf("GPS RX: IO%d\n", current_rx_pin);
-    TERMINAL_VIEW_ADD_TEXT("GPS RX: IO%d\n", current_rx_pin);
+    glog("GPS RX: IO%d\n", current_rx_pin);
 
     esp_comm_manager_deinit();
     #ifdef CONFIG_USE_TDISPLAY_S3
@@ -117,9 +122,22 @@ void gps_manager_init(GPSManager *manager) {
 #endif
 
     nmea_hdl = nmea_parser_init(&config);
+    if (!nmea_hdl) {
+        ESP_LOGE(GPS_TAG, "Failed to initialize NMEA parser");
+        manager->isinitilized = false;
+        esp_comm_manager_init_with_defaults();
+        return;
+    }
     nmea_parser_add_handler(nmea_hdl, gps_event_handler, NULL);
     manager->isinitilized = true;
-    xTaskCreate(check_gps_connection_task, "gps_check", 2048, NULL, 1, &gps_check_task_handle);
+    status_display_show_status("GPS Initialized");
+    BaseType_t task_created = xTaskCreate(check_gps_connection_task, "gps_check", 3072, NULL, 1, &gps_check_task_handle);
+    if (task_created != pdPASS) {
+        ESP_LOGW(GPS_TAG, "Failed to create gps_check task");
+        gps_check_task_handle = NULL;
+        status_display_show_status("GPS Task Fail");
+        // proceed without the connection-check task; parser remains initialized
+    }
 }
 
 static void check_gps_connection_task(void *pvParameters) {
@@ -143,8 +161,7 @@ static void check_gps_connection_task(void *pvParameters) {
         if (!gps_connection_logged &&
             (gps->tim.hour != 0 || gps->tim.minute != 0 || gps->tim.second != 0 ||
              gps->latitude != 0 || gps->longitude != 0)) {
-            printf("GPS Module Connected\nReceiving Data\n");
-            TERMINAL_VIEW_ADD_TEXT("GPS Module Connected\nReceiving Data\n");
+            glog("GPS Module Connected\nReceiving Data\n");
             gps_connection_logged = true;
             gps_check_task_handle = NULL;
             vTaskDelete(NULL);
@@ -155,8 +172,7 @@ static void check_gps_connection_task(void *pvParameters) {
     }
 
     // If we reach here, connection check timed out
-    printf("GPS Module Connection Timeout\nCheck your connections\n");
-    TERMINAL_VIEW_ADD_TEXT("GPS Module Connection Timeout\nCheck your connections\n");
+    glog("GPS Module Connection Timeout\nCheck your connections\n");
     gps_timeout_detected = true;
     gps_check_task_handle = NULL;
     vTaskDelete(NULL);
@@ -170,11 +186,19 @@ void gps_manager_deinit(GPSManager *manager) {
             gps_check_task_handle = NULL;
         }
 
-        nmea_parser_remove_handler(nmea_hdl, gps_event_handler);
-        nmea_parser_deinit(nmea_hdl);
+        if (nmea_hdl) {
+            nmea_parser_remove_handler(nmea_hdl, gps_event_handler);
+            nmea_parser_deinit(nmea_hdl);
+            nmea_hdl = NULL;
+        } else {
+            ESP_LOGW(GPS_TAG, "gps_manager_deinit called but nmea_hdl is NULL");
+        }
         manager->isinitilized = false;
         gps_connection_logged = false;
+        status_display_show_status("GPS Deinit");
         esp_comm_manager_init_with_defaults();
+    } else {
+        status_display_show_status("GPS Not Init");
     }
 }
 
@@ -190,7 +214,7 @@ esp_err_t gps_manager_log_wardriving_data(wardriving_data_t *data) {
     }
     gps_t *gps = &((esp_gps_t *)nmea_hdl)->parent;
     if (!data->ble_data.is_ble_device) {
-        if (!gps->valid || strlen(data->ssid) <= 2) {
+        if (!gps->valid || data->ssid[0] == '\0' || strlen(data->ssid) <= 2) {
             return ESP_ERR_INVALID_ARG;
         }
     } else {
@@ -245,7 +269,7 @@ esp_err_t gps_manager_log_wardriving_data(wardriving_data_t *data) {
             gps->sats_in_use >= 3 &&
             gps->sats_in_use <= GPS_MAX_SATELLITES_IN_USE && // Should be ≤ 12
             rand() % 100 == 0) {
-            printf("Warning: GPS date is out of range despite good fix: %04d-%02d-%02d "
+            glog("Warning: GPS date is out of range despite good fix: %04d-%02d-%02d "
                    "(Fix: %d, Mode: %d, Sats: %d)\n",
                    gps_get_absolute_year(gps->date.year), gps->date.month, gps->date.day, gps->fix,
                    gps->fix_mode, gps->sats_in_use);
@@ -261,7 +285,7 @@ esp_err_t gps_manager_log_wardriving_data(wardriving_data_t *data) {
 
     if (gps->tim.hour > 23 || gps->tim.minute > 59 || gps->tim.second > 59) {
         if (rand() % 20 == 0) {
-            printf("Warning: GPS time is invalid: %02d:%02d:%02d\n", gps->tim.hour, gps->tim.minute,
+            glog("Warning: GPS time is invalid: %02d:%02d:%02d\n", gps->tim.hour, gps->tim.minute,
                    gps->tim.second);
         }
         return ESP_OK;
@@ -270,7 +294,7 @@ esp_err_t gps_manager_log_wardriving_data(wardriving_data_t *data) {
     if (gps->latitude < -90.0 || gps->latitude > 90.0 || gps->longitude < -180.0 ||
         gps->longitude > 180.0) {
         if (rand() % 20 == 0) {
-            printf("GPS Error: Invalid location detected (Lat: %f, Lon: %f)\n", gps->latitude,
+            glog("GPS Error: Invalid location detected (Lat: %f, Lon: %f)\n", gps->latitude,
                    gps->longitude);
         }
         return ESP_OK;
@@ -278,7 +302,7 @@ esp_err_t gps_manager_log_wardriving_data(wardriving_data_t *data) {
 
     if (gps->speed < 0.0 || gps->speed > 340.0) {
         if (rand() % 20 == 0) {
-            printf("Warning: GPS speed is out of range: %f m/s\n", gps->speed);
+            glog("Warning: GPS speed is out of range: %f m/s\n", gps->speed);
         }
         return ESP_OK;
     }
@@ -286,7 +310,7 @@ esp_err_t gps_manager_log_wardriving_data(wardriving_data_t *data) {
     if (gps->dop_h < 0.0 || gps->dop_p < 0.0 || gps->dop_v < 0.0 || gps->dop_h > 50.0 ||
         gps->dop_p > 50.0 || gps->dop_v > 50.0) {
         if (rand() % 20 == 0) {
-            printf("Warning: GPS DOP values are out of range: HDOP: %f, PDOP: %f, "
+            glog("Warning: GPS DOP values are out of range: HDOP: %f, PDOP: %f, "
                    "VDOP: %f\n",
                    gps->dop_h, gps->dop_p, gps->dop_v);
         }
@@ -330,15 +354,10 @@ esp_err_t gps_manager_log_wardriving_data(wardriving_data_t *data) {
         }
 
         // Add newline before status update for better readability
-        printf("\n");
-        printf(
-            GPS_STATUS_MESSAGE, fix_status, data->gps_quality.satellites_used,
-            GPS_MAX_SATELLITES_IN_USE,
-            data->gps_quality.speed * 3.6, // Convert m/s to km/h
-            get_gps_quality_string(data)); // Only keep the arguments that match the format string
-        TERMINAL_VIEW_ADD_TEXT(GPS_STATUS_MESSAGE, fix_status, data->gps_quality.satellites_used,
-                               GPS_MAX_SATELLITES_IN_USE, data->gps_quality.speed * 3.6,
-                               get_gps_quality_string(data));
+        glog("\n");
+        glog(GPS_STATUS_MESSAGE, fix_status, data->gps_quality.satellites_used,
+             GPS_MAX_SATELLITES_IN_USE, data->gps_quality.speed * 3.6, // Convert m/s to km/h
+             get_gps_quality_string(data));
     }
 
     return ret;

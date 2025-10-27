@@ -54,6 +54,56 @@
 #include "managers/fuel_gauge_manager.h"
 #endif
 
+// Global low-I2C activity mode. When true, subsystems should avoid I2C-heavy polling/logging
+// to reduce contention (e.g., while PN532 scanning/bruteforcing).
+static volatile bool g_low_i2c_mode = false;
+
+#ifdef CONFIG_HAS_FUEL_GAUGE
+// Background polling to avoid blocking LVGL timer with I2C operations
+static TaskHandle_t battery_poll_task_handle = NULL;
+static volatile uint8_t g_cached_batt_percent = 0;
+static volatile bool g_cached_batt_charging = false;
+static volatile bool g_cached_batt_valid = false;
+static void battery_poll_task(void *arg) {
+  fuel_gauge_data_t fg;
+  uint8_t last_pct = 0xFF;
+  bool last_chg = false;
+  int stable = 0;
+  uint32_t delay_ms = 2000;
+  for (;;) {
+    // In low-I2C mode, pause polling to avoid I2C contention
+    if (g_low_i2c_mode) {
+      vTaskDelay(pdMS_TO_TICKS(5000));
+      continue;
+    }
+    if (fuel_gauge_manager_get_data(&fg)) {
+      g_cached_batt_percent = (uint8_t)fg.percentage;
+      g_cached_batt_charging = fg.is_charging;
+      g_cached_batt_valid = true;
+      if (last_pct == g_cached_batt_percent && last_chg == g_cached_batt_charging) {
+        if (stable < 6) stable++;
+      } else {
+        stable = 0;
+      }
+      last_pct = g_cached_batt_percent;
+      last_chg = g_cached_batt_charging;
+    }
+    if (!g_cached_batt_valid) {
+      delay_ms = 2000;
+    } else if (g_cached_batt_charging) {
+      delay_ms = 1000;
+    } else if (stable >= 6) {
+      delay_ms = 15000;
+    } else if (stable >= 3) {
+      delay_ms = 5000;
+    } else {
+      delay_ms = 2000;
+    }
+    vTaskDelay(pdMS_TO_TICKS(delay_ms));
+  }
+}
+#endif
+
 #ifdef CONFIG_HAS_RTC_CLOCK
 #include "vendor/drivers/pcf8563.h"
 #endif
@@ -286,12 +336,34 @@ static bool get_battery_info(uint8_t *percentage, bool *is_charging) {
         return result;
     }
 
+    // Cache for non-fuel-gauge configurations to avoid I2C access in low mode
+    static uint8_t last_pct_cache = 0;
+    static bool last_chg_cache = false;
+    static bool last_valid_cache = false;
+
+    // When low-I2C mode is active, avoid any fresh I2C queries here.
+    // For fuel-gauge configs, we already maintain cached values via the background task.
+    if (g_low_i2c_mode) {
 #ifdef CONFIG_HAS_FUEL_GAUGE
-    // Try fuel gauge first (most accurate)
-    int fuel_percentage = fuel_gauge_manager_get_percentage();
-    if (fuel_percentage >= 0) {
-        *percentage = (uint8_t)fuel_percentage;
-        *is_charging = fuel_gauge_manager_is_charging();
+        if (g_cached_batt_valid) {
+            *percentage = g_cached_batt_percent;
+            *is_charging = g_cached_batt_charging;
+            return true;
+        }
+#endif
+        if (last_valid_cache) {
+            *percentage = last_pct_cache;
+            *is_charging = last_chg_cache;
+            return true;
+        }
+        return false;
+    }
+
+#ifdef CONFIG_HAS_FUEL_GAUGE
+    // Use cached fuel gauge values updated by background task (non-blocking)
+    if (g_cached_batt_valid) {
+        *percentage = g_cached_batt_percent;
+        *is_charging = g_cached_batt_charging;
         result = true;
     }
 #elif defined(CONFIG_HAS_BATTERY)
@@ -305,9 +377,22 @@ static bool get_battery_info(uint8_t *percentage, bool *is_charging) {
     *is_charging = isCharging();
     result = true;
 #endif
-    ESP_LOGI(TAG, "get_battery_info %d%%, Charging: %d", *percentage, *is_charging);
+    ESP_LOGD(TAG, "get_battery_info %d%%, Charging: %d", *percentage, *is_charging);
+
+    // Update local cache for non-fuel-gauge builds
+#if !defined(CONFIG_HAS_FUEL_GAUGE)
+    if (result) {
+        last_pct_cache = *percentage;
+        last_chg_cache = *is_charging;
+        last_valid_cache = true;
+    }
+#endif
 
     return result;
+}
+
+void display_manager_set_low_i2c_mode(bool on) {
+    g_low_i2c_mode = on;
 }
 
 void fade_out_cb(void *obj, int32_t v) {
@@ -376,6 +461,17 @@ void display_manager_fade_in(lv_obj_t *obj) {
   lv_anim_start(&anim);
 }
 
+// recursively set radius for obj and its children (used to avoid mask draws during heavy transitions)
+static void set_radius_recursive(lv_obj_t *obj, lv_coord_t r) {
+  if (!obj) return;
+  lv_obj_set_style_radius(obj, r, 0);
+  uint32_t cnt = lv_obj_get_child_cnt(obj);
+  for (uint32_t i = 0; i < cnt; i++) {
+    lv_obj_t *c = lv_obj_get_child(obj, i);
+    if (c) set_radius_recursive(c, r);
+  }
+}
+
 void fade_out_ready_cb(lv_anim_t *anim) {
   display_manager_destroy_current_view();
 
@@ -389,8 +485,22 @@ void fade_out_ready_cb(lv_anim_t *anim) {
     }
 
     new_view->create();
-    display_manager_fade_in(new_view->root);
-    display_manager_fade_in(status_bar);
+
+    // Avoid running the per-tick fade animation for the keyboard view because
+    // the opacity animation forces heavy draw work (masks/labels) and can
+    // starve the LVGL tick/watchdog during the keyboard fade-in.
+    if (new_view->name && strcmp(new_view->name, "Keyboard Screen") == 0) {
+      if (new_view->root) {
+        // make fully opaque immediately
+        lv_obj_set_style_opa(new_view->root, LV_OPA_COVER, 0);
+        // temporarily remove rounded radii to avoid expensive mask draws
+        set_radius_recursive(new_view->root, 0);
+      }
+      if (status_bar) lv_obj_set_style_opa(status_bar, LV_OPA_COVER, 0);
+    } else {
+      display_manager_fade_in(new_view->root);
+      display_manager_fade_in(status_bar);
+    }
   }
 }
 
@@ -794,11 +904,14 @@ set_keyboard_brightness(0xFF); // Set to 100% brightness
 #if !defined(CONFIG_USE_7_INCHER) && !defined(CONFIG_JC3248W535EN_LCD)
 /* For cardputer (no PSRAM) use a single smaller buffer to save internal RAM.
    Single buffer increases flush frequency but greatly reduces RAM usage. */
-#if defined(CONFIG_USE_CARDPUTER)
-  static lv_color_t buf1[CONFIG_TFT_WIDTH * 2] __attribute__((aligned(4)));
-#elif defined(CONFIG_IDF_TARGET_ESP32) || defined(CONFIG_IDF_TARGET_ESP32C5)
+#if defined(CONFIG_USE_CARDPUTER) || defined(CONFIG_USE_CARDPUTER_ADV)
+  static lv_color_t buf1[CONFIG_TFT_WIDTH * 3] __attribute__((aligned(4)));
+#elif defined(CONFIG_IDF_TARGET_ESP32C5)
+  /* Use a single buffer on ESP32-C5 sized to provide a responsive feel on 240x320 displays */
+  /* width * 8 gives ~8 lines of buffer which balances responsiveness and RAM use */
   static lv_color_t buf1[CONFIG_TFT_WIDTH * 5] __attribute__((aligned(4)));
-  static lv_color_t buf2[CONFIG_TFT_WIDTH * 5] __attribute__((aligned(4)));
+#elif defined(CONFIG_IDF_TARGET_ESP32)
+  static lv_color_t buf1[CONFIG_TFT_WIDTH * 3] __attribute__((aligned(4)));
 #else
   static lv_color_t buf1[CONFIG_TFT_WIDTH * 20] __attribute__((aligned(4)));
   static lv_color_t buf2[CONFIG_TFT_WIDTH * 20] __attribute__((aligned(4)));
@@ -817,10 +930,18 @@ set_keyboard_brightness(0xFF); // Set to 100% brightness
 #endif
 
   static lv_disp_draw_buf_t disp_buf;
+/* Initialize draw buffer: prefer single-buffer on cardputer, ESP32, and ESP32-C5 */
 #if defined(CONFIG_USE_CARDPUTER)
-  /* single buffer mode: pass NULL for second buffer and set size accordingly */
+  /* single buffer mode: small buffer for low-memory cardputer */
   lv_disp_draw_buf_init(&disp_buf, buf1, NULL, width * 2);
+#elif defined(CONFIG_IDF_TARGET_ESP32C5) || defined(CONFIG_IDF_TARGET_ESP32S2)
+  /* single buffer mode: use width * 5 for responsive drawing without excessive RAM */
+  lv_disp_draw_buf_init(&disp_buf, buf1, NULL, width * 5);
+#elif defined(CONFIG_IDF_TARGET_ESP32)
+  /* single buffer mode: use width * 3 for ESP32 to save DRAM */
+  lv_disp_draw_buf_init(&disp_buf, buf1, NULL, width * 3);
 #else
+  /* default: double buffer for smoother drawing */
   lv_disp_draw_buf_init(&disp_buf, buf1, buf2, width * 5);
 #endif
 
@@ -883,6 +1004,9 @@ set_keyboard_brightness(0xFF); // Set to 100% brightness
 #ifdef CONFIG_HAS_FUEL_GAUGE
   if (fuel_gauge_manager_init()) {
     ESP_LOGI(TAG, "Fuel gauge manager initialized successfully");
+    if (battery_poll_task_handle == NULL) {
+      xTaskCreate(battery_poll_task, "battery_poll", 4096, NULL, 5, &battery_poll_task_handle);
+    }
   } else {
     ESP_LOGW(TAG, "Failed to initialize fuel gauge manager");
   }
@@ -948,41 +1072,45 @@ bool display_manager_register_view(View *view) {
   return true;
 }
 
-void display_manager_switch_view(View *view) {
-  if (view == NULL)
-    return;
-
+static void display_manager_switch_view_internal(View *view) {
+  if (view == NULL) return;
 #ifdef CONFIG_JC3248W535EN_LCD
   bsp_display_lock(0);
 #endif
-
   if (xSemaphoreTake(dm.mutex, pdMS_TO_TICKS(MUTEX_TIMEOUT_MS)) == pdTRUE) {
-    ESP_LOGI(TAG, "Switching view from %s to %s",
-           dm.current_view ? dm.current_view->name : "NULL", view->name);
-
+    ESP_LOGI(TAG, "Switching view from %s to %s", dm.current_view ? dm.current_view->name : "NULL", view->name);
     if (dm.current_view && dm.current_view->root) {
-      display_manager_previous_view = dm.current_view; // Store current view as previous
+      display_manager_previous_view = dm.current_view;
       display_manager_fade_out(dm.current_view->root, fade_out_ready_cb, view);
     } else {
-      display_manager_previous_view = dm.current_view; // Store current view as previous
+      display_manager_previous_view = dm.current_view;
       dm.current_view = view;
-
       if (view->get_hardwareinput_callback) {
         view->get_hardwareinput_callback((void **)&dm.current_view->input_callback);
       }
-
       view->create();
       display_manager_fade_in(view->root);
     }
-
     xSemaphoreGive(dm.mutex);
   } else {
     ESP_LOGE(TAG, "Failed to acquire mutex for switching view\n");
   }
-
 #ifdef CONFIG_JC3248W535EN_LCD
   bsp_display_unlock();
 #endif
+}
+
+static void dm_switch_async_cb(void *param) {
+  display_manager_switch_view_internal((View *)param);
+}
+
+void display_manager_switch_view(View *view) {
+  if (view == NULL) return;
+  if (lvgl_task_handle && xTaskGetCurrentTaskHandle() != lvgl_task_handle) {
+    lv_async_call(dm_switch_async_cb, view);
+    return;
+  }
+  display_manager_switch_view_internal(view);
 }
 
 void display_manager_destroy_current_view(void) {
@@ -997,6 +1125,8 @@ void display_manager_destroy_current_view(void) {
 
 View *display_manager_get_current_view(void) { return dm.current_view; }
 
+bool display_manager_is_available(void) { return display_manager_init_success; }
+
 void display_manager_fill_screen(lv_color_t color) {
   static lv_style_t style;
   lv_style_init(&style);
@@ -1004,6 +1134,16 @@ void display_manager_fill_screen(lv_color_t color) {
   lv_style_set_bg_opa(&style, LV_OPA_COVER);
   lv_obj_set_scrollbar_mode(lv_scr_act(), LV_SCROLLBAR_MODE_OFF);
   lv_obj_add_style(lv_scr_act(), &style, LV_PART_MAIN | LV_STATE_DEFAULT);
+}
+
+void display_manager_suspend_lvgl_task(void) {
+  if (!lvgl_task_handle) return;
+  if (xTaskGetCurrentTaskHandle() == lvgl_task_handle) return;
+  vTaskSuspend(lvgl_task_handle);
+}
+
+void display_manager_resume_lvgl_task(void) {
+  if (lvgl_task_handle) vTaskResume(lvgl_task_handle);
 }
 
 void set_backlight_brightness(uint8_t percentage) {
@@ -1108,6 +1248,20 @@ void set_backlight_brightness(uint8_t percentage) {
     }
 }
 
+bool display_manager_notify_user_input(void) {
+    // If backlight is dimmed/off, restore it and indicate the input was used to wake
+    if (is_backlight_dimmed || is_backlight_off) {
+        set_backlight_brightness(100);
+        is_backlight_dimmed = false;
+        is_backlight_off = false;
+        last_touch_time = xTaskGetTickCount();
+        return true;
+    }
+    // otherwise update last_touch_time and allow normal processing
+    last_touch_time = xTaskGetTickCount();
+    return false;
+}
+
 void hardware_input_task(void *pvParameters) {
   const TickType_t tick_interval = pdMS_TO_TICKS(10);
 
@@ -1119,9 +1273,12 @@ void hardware_input_task(void *pvParameters) {
   int screen_height = LV_VER_RES;
   bool was_woken_by_interrupt = false; // New flag for S3T-Watch
 #ifdef CONFIG_USE_CARDPUTER
-  uint8_t shift_count_before_caps =75; // num of cycles before capslock gets turned on
+  uint8_t shift_count_before_caps =255; // effectively disable hold-to-caps for normal cardputer
   uint8_t shift_count = 0;
   bool caps_latch = false; // var for tracking if caps was just toggled
+  // track last pressed keys to emit only on new press (avoid spam)
+  static Point2D_t last_pressed_keys[16];
+  static size_t last_pressed_len = 0;
 #endif
   while (1) {
 #ifdef CONFIG_USE_TDECK
@@ -1290,6 +1447,9 @@ void hardware_input_task(void *pvParameters) {
     keyboard_update_key_list(&gkeyboard);
     keyboard_update_keys_state(&gkeyboard);
 
+    // force caps-lock off for normal cardputer so letters aren't stuck uppercase
+    gkeyboard.is_caps_locked = false;
+
       if (!keyboard_is_key_pressed(&gkeyboard,129) && caps_latch){ // caps lock latch so it doesnt continuously flip on and off
         caps_latch = false;
         shift_count = 0;
@@ -1299,11 +1459,21 @@ void hardware_input_task(void *pvParameters) {
 
       for (size_t i = 0; i < gkeyboard.key_list_buffer_len; ++i) {
         Point2D_t key_pos = gkeyboard.key_list_buffer[i];
+        // emit only on new press (edge-triggered)
+        bool is_new_press = true;
+        for (size_t k = 0; k < last_pressed_len; ++k) {
+          if (last_pressed_keys[k].x == key_pos.x && last_pressed_keys[k].y == key_pos.y) {
+            is_new_press = false;
+            break;
+          }
+        }
+        if (!is_new_press) {
+          continue;
+        }
         uint8_t key_value = keyboard_get_key(&gkeyboard, key_pos);
         keyboard_update_keys_state(&gkeyboard);
-        if (key_value != 0 && !touch_active) {
+        if (key_value != 0) {
           bool skip_event = false;
-          touch_active = true;
           last_touch_time = xTaskGetTickCount();
           if (is_backlight_dimmed) {
             // CARDPUTER wake logic is keypress-to-wake, which is desired.
@@ -1351,15 +1521,16 @@ void hardware_input_task(void *pvParameters) {
               ESP_LOGE(TAG, "Failed to send button input to queue\n");
             }
           }
-          vTaskDelay(pdMS_TO_TICKS(300));
-
-        } else if (touch_active) {
-
-          touch_active = false;
 
         }
       }
-    }
+      }
+      // update last pressed cache (cap to 16)
+      last_pressed_len = gkeyboard.key_list_buffer_len;
+      if (last_pressed_len > 16) last_pressed_len = 16;
+      for (size_t m = 0; m < last_pressed_len; ++m) {
+        last_pressed_keys[m] = gkeyboard.key_list_buffer[m];
+      }
 #endif
 
 #ifdef CONFIG_USE_JOYSTICK
@@ -1480,9 +1651,11 @@ void processEvent() {
     return;
   }
 
+  const int max_events = 8;
+  int processed = 0;
   InputEvent event;
 
-  if (xQueueReceive(input_queue, &event, pdMS_TO_TICKS(10)) == pdTRUE) {
+  while (processed < max_events && xQueueReceive(input_queue, &event, 0) == pdTRUE) {
     if (xSemaphoreTake(dm.mutex, pdMS_TO_TICKS(MUTEX_TIMEOUT_MS)) == pdTRUE) {
       View *current = dm.current_view;
       void (*input_callback)(InputEvent *) = NULL;
@@ -1497,11 +1670,30 @@ void processEvent() {
 
       xSemaphoreGive(dm.mutex);
 
-      ESP_LOGD(TAG, "Input event type: %d, Current view: %s\n", event.type,
-               view_name);
+      ESP_LOGD(TAG, "Input event type: %d, Current view: %s\n", event.type, view_name);
+      if (input_callback) input_callback(&event);
+    }
+    processed++;
+  }
 
-      if (input_callback) {
-        input_callback(&event);
+  if (processed == 0) {
+    if (xQueueReceive(input_queue, &event, pdMS_TO_TICKS(1)) == pdTRUE) {
+      if (xSemaphoreTake(dm.mutex, pdMS_TO_TICKS(MUTEX_TIMEOUT_MS)) == pdTRUE) {
+        View *current = dm.current_view;
+        void (*input_callback)(InputEvent *) = NULL;
+        const char *view_name = "NULL";
+
+        if (current) {
+          view_name = current->name;
+          input_callback = current->input_callback;
+        } else {
+          ESP_LOGW(TAG, "Current view is NULL in input_processing_task\n");
+        }
+
+        xSemaphoreGive(dm.mutex);
+
+        ESP_LOGD(TAG, "Input event type: %d, Current view: %s\n", event.type, view_name);
+        if (input_callback) input_callback(&event);
       }
     }
   }
@@ -1509,10 +1701,20 @@ void processEvent() {
 
 void lvgl_tick_task(void *arg) {
   const TickType_t tick_interval = pdMS_TO_TICKS(10);
+  TickType_t last_mon = 0;
   while (1) {
       processEvent();
       lv_timer_handler();
       lv_tick_inc(10);
+      // Monitor input queue backlog periodically
+      TickType_t now = xTaskGetTickCount();
+      if (now - last_mon >= pdMS_TO_TICKS(500)) {
+          UBaseType_t pending = uxQueueMessagesWaiting((QueueHandle_t)input_queue);
+          if (pending > 0) {
+              ESP_LOGW(TAG, "lvgl_tick: input_queue backlog=%u", (unsigned)pending);
+          }
+          last_mon = now;
+      }
       vTaskDelay(tick_interval);
   }
   vTaskDelete(NULL);

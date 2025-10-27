@@ -1,5 +1,6 @@
 #include "vendor/pcap.h"
 #include "core/utils.h"
+#include "core/glog.h"
 #include "driver/uart.h"
 #include "esp_log.h"
 #include "esp_vfs_fat.h"
@@ -11,6 +12,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <stdlib.h>
 
 #define RADIOTAP_HEADER_LEN 8
 
@@ -19,6 +21,13 @@ static bool is_valid_tag_length(uint8_t tag_num, uint8_t tag_len);
 static bool is_valid_beacon_fixed_params(const uint8_t *frame, size_t offset,
                                          size_t max_len);
 static esp_err_t _pcap_flush_buffer_to_file_nolock();
+static char pcap_file_path[MAX_FILE_NAME_LENGTH];
+static char pcap_base_name[32] = "capture";
+static volatile pcap_capture_type_t s_capture_type = PCAP_CAPTURE_WIFI;
+static uint8_t pcap_buffer[PCAP_BUFFER_SIZE];
+static size_t buffer_offset = 0;
+static FILE *pcap_file = NULL;
+static SemaphoreHandle_t pcap_mutex = NULL;
 
 typedef struct {
   uint8_t packet_type; // HCI packet type (1 byte)
@@ -43,16 +52,19 @@ esp_err_t pcap_init(void) {
 }
 
 esp_err_t pcap_write_global_header(FILE *f, pcap_capture_type_t capture_type) {
+  uint32_t dlt = DLT_IEEE802_11_RADIO;
+  if (capture_type == PCAP_CAPTURE_BLUETOOTH) {
+    dlt = DLT_BLUETOOTH_HCI_H4;
+  } else if (capture_type == PCAP_CAPTURE_IEEE802154) {
+    dlt = DLT_IEEE802_15_4_NOFCS;
+  }
   pcap_global_header_t header = {.magic_number = 0xa1b2c3d4,
                                  .version_major = 2,
                                  .version_minor = 4,
                                  .thiszone = 0,
                                  .sigfigs = 0,
                                  .snaplen = 65535,
-                                 .network =
-                                     (capture_type == PCAP_CAPTURE_BLUETOOTH)
-                                         ? DLT_BLUETOOTH_HCI_H4
-                                         : DLT_IEEE802_11_RADIO};
+                                 .network = dlt};
 
   if (f == NULL) {
     const char *mark_begin = "[BUF/BEGIN]";
@@ -60,18 +72,22 @@ esp_err_t pcap_write_global_header(FILE *f, pcap_capture_type_t capture_type) {
     const char *mark_close = "[BUF/CLOSE]";
     const size_t mark_close_len = strlen(mark_close);
 
+    glog_set_defer(1);
     uart_write_bytes(UART_NUM_0, mark_begin, mark_begin_len);
-
     uart_write_bytes(UART_NUM_0, (const char *)&header, sizeof(header));
-
     uart_write_bytes(UART_NUM_0, mark_close, mark_close_len);
-
-    const char *newline = "\n";
-    uart_write_bytes(UART_NUM_0, newline, 1);
+    const char newline = '\n';
+    uart_write_bytes(UART_NUM_0, &newline, 1);
+    glog_set_defer(0);
+    glog_flush_deferred();
     return ESP_OK;
   } else {
     size_t written = fwrite(&header, 1, sizeof(header), f);
-    return (written == sizeof(header)) ? ESP_OK : ESP_FAIL;
+    if (written == sizeof(header)) {
+      fflush(f);
+      return ESP_OK;
+    }
+    return ESP_FAIL;
   }
 }
 
@@ -89,27 +105,72 @@ esp_err_t pcap_file_open(const char *base_file_name,
     ESP_LOGE(PCAP_TAG, "Failed to initialize PCAP");
     return init_ret;
   }
-
   char file_name[MAX_FILE_NAME_LENGTH];
+  file_name[0] = '\0';
+  if (base_file_name && *base_file_name) {
+    strncpy(pcap_base_name, base_file_name, sizeof(pcap_base_name) - 1);
+    pcap_base_name[sizeof(pcap_base_name) - 1] = '\0';
+  }
+
+#ifdef CONFIG_BUILD_CONFIG_TEMPLATE
+  bool jit_template = (strcmp(CONFIG_BUILD_CONFIG_TEMPLATE, "somethingsomething") == 0);
+#else
+  bool jit_template = false;
+#endif
+
+  /* take mutex to protect pcap_file and buffer_offset during open */
+  if (pcap_mutex == NULL) {
+    ESP_LOGE(PCAP_TAG, "pcap_mutex is NULL in pcap_file_open");
+    return ESP_ERR_INVALID_STATE;
+  }
+
+  if (xSemaphoreTake(pcap_mutex, pdMS_TO_TICKS(1000)) != pdTRUE) {
+    ESP_LOGE(PCAP_TAG, "Failed to take mutex in pcap_file_open");
+    return ESP_ERR_TIMEOUT;
+  }
 
   if (sd_card_exists("/mnt/ghostesp/pcaps")) {
     get_next_pcap_file_name(file_name, base_file_name);
     pcap_file = fopen(file_name, "wb");
     if (!pcap_file) {
-      printf("PCAP file is not open. Flushing to Serial...");
+      ESP_LOGW(PCAP_TAG, "PCAP file is not open, will flush to serial");
+    }
+    if (file_name[0] != '\0') {
+      strncpy(pcap_file_path, file_name, sizeof(pcap_file_path) - 1);
+      pcap_file_path[sizeof(pcap_file_path) - 1] = '\0';
     }
   }
 
   esp_err_t ret = pcap_write_global_header(pcap_file, capture_type);
   if (ret != ESP_OK) {
     ESP_LOGE(PCAP_TAG, "Failed to write PCAP global header.");
-    fclose(pcap_file);
-    pcap_file = NULL;
+    if (pcap_file) {
+      fclose(pcap_file);
+      pcap_file = NULL;
+    }
+    xSemaphoreGive(pcap_mutex);
     return ret;
   }
 
-  ESP_LOGI(PCAP_TAG, "PCAP file %s opened and global header written.",
-           file_name);
+  if (file_name[0] != '\0') {
+    ESP_LOGI(PCAP_TAG, "PCAP file %s opened and global header written.",
+             file_name);
+    if (pcap_file != NULL) {
+      glog("PCAP: saving to SD as %s\n", file_name);
+    } else {
+      glog("PCAP: streaming over UART (SD open failed)\n");
+    }
+  } else {
+    if (jit_template) {
+      ESP_LOGI(PCAP_TAG, "PCAP will JIT mount SD on first flush (no file open yet).");
+      glog("PCAP: JIT mounting SD on first flush\n");
+    } else {
+      ESP_LOGI(PCAP_TAG, "PCAP using serial (no file) and global header written.");
+      glog("PCAP: streaming over UART (no SD)\n");
+    }
+  }
+
+  xSemaphoreGive(pcap_mutex);
   return ESP_OK;
 }
 
@@ -321,6 +382,7 @@ static bool is_valid_beacon_fixed_params(const uint8_t *frame, size_t offset,
 
 esp_err_t pcap_write_packet_to_buffer(const void *packet, size_t length,
                                       pcap_capture_type_t capture_type) {
+  s_capture_type = capture_type;
   if (packet == NULL || length < 2) {
     ESP_LOGE(PCAP_TAG, "Invalid packet data");
     return ESP_ERR_INVALID_ARG;
@@ -333,44 +395,50 @@ esp_err_t pcap_write_packet_to_buffer(const void *packet, size_t length,
 
   size_t actual_length;
   size_t header_length = 0;
+  uint8_t bt_h4_header[4];
+  int is_bt = 0;
 
   if (capture_type == PCAP_CAPTURE_WIFI) {
     const uint8_t *frame = (const uint8_t *)packet;
     actual_length = calculate_wifi_frame_length(frame, length);
     header_length = RADIOTAP_HEADER_LEN;
+  } else if (capture_type == PCAP_CAPTURE_IEEE802154) {
+    // IEEE 802.15.4 frames are written as-is (no FCS) with NOFCS DLT
+    actual_length = length;
+    header_length = 0;
   } else if (capture_type == PCAP_CAPTURE_BLUETOOTH) {
     const uint8_t *raw_packet = (const uint8_t *)packet;
 
-    // Add Bluetooth H4 header (4 bytes)
-    uint8_t h4_header[4] = {
-        0x00,          // Direction: Host to Controller
-        raw_packet[0], // HCI packet type
-        0x00, 0x00     // Reserved
-    };
+    /* prepare H4 header (direction + hci packet type + reserved) */
+    bt_h4_header[0] = 0x00; /* direction: host to controller */
+    bt_h4_header[1] = raw_packet[0];
+    bt_h4_header[2] = 0x00;
+    bt_h4_header[3] = 0x00;
 
-    // Calculate total length including H4 header
-    actual_length = length + sizeof(h4_header);
+    /* total length includes the H4 header */
+    actual_length = length + sizeof(bt_h4_header);
     header_length = 0;
-
-    // Copy H4 header and packet data to a temporary buffer
-    uint8_t *temp_buffer = malloc(actual_length);
-    if (!temp_buffer) {
-      xSemaphoreGive(pcap_mutex);
-      return ESP_ERR_NO_MEM;
-    }
-
-    memcpy(temp_buffer, h4_header, sizeof(h4_header));
-    memcpy(temp_buffer + sizeof(h4_header), packet, length);
-
-    // Update packet pointer and length
-    packet = temp_buffer;
-    ESP_LOGI(PCAP_TAG, "Writing BT packet with H4 header, total len=%d",
-             actual_length);
+    is_bt = 1;
   } else {
     const uint8_t *hci_packet = (const uint8_t *)packet;
-    // Verify HCI packet type (should be 0x04 for events)
-    if (hci_packet[0] != 0x04) {
-      ESP_LOGE(PCAP_TAG, "Invalid HCI packet type: 0x%02x", hci_packet[0]);
+    /* Accept common HCI packet types:
+       0x01 - HCI Command (from host)
+       0x02 - ACL Data
+       0x03 - SCO Data
+       0x04 - HCI Event
+       0x05 - ISO Data
+       Reject others as invalid. */
+    uint8_t pkt_type = hci_packet[0];
+    switch (pkt_type) {
+    case 0x01: /* command */
+    case 0x02: /* acl */
+    case 0x03: /* sco */
+    case 0x04: /* event */
+    case 0x05: /* iso */
+      /* accepted */
+      break;
+    default:
+      ESP_LOGE(PCAP_TAG, "Invalid HCI packet type: 0x%02x", pkt_type);
       xSemaphoreGive(pcap_mutex);
       return ESP_ERR_INVALID_ARG;
     }
@@ -430,12 +498,31 @@ esp_err_t pcap_write_packet_to_buffer(const void *packet, size_t length,
   }
 
   // Write packet data
-  memcpy(pcap_buffer + buffer_offset, packet, actual_length);
-  buffer_offset += actual_length;
+  if (is_bt) {
+    /* write h4 header then the raw packet payload (without extra allocation) */
+    memcpy(pcap_buffer + buffer_offset, bt_h4_header, sizeof(bt_h4_header));
+    buffer_offset += sizeof(bt_h4_header);
+    memcpy(pcap_buffer + buffer_offset, packet, length);
+    buffer_offset += length;
+  } else {
+    memcpy(pcap_buffer + buffer_offset, packet, actual_length);
+    buffer_offset += actual_length;
+  }
 
   if (pcap_file == NULL) {
     _pcap_flush_buffer_to_file_nolock();
   }
+  /* if we had allocated a temporary BT buffer earlier it would have been
+     pointed to by `packet` (only in the fallback malloc path). Free it now
+     if necessary. We can detect that by checking is_bt and whether the
+     original packet pointer differs from the buffer in flash/ram — but
+     since we avoided allocating in the fast path, the only allocation case
+     used `packet` pointing to heap memory. To keep logic simple, if
+     is_bt and the packet pointer lies within pcap_buffer region we do not
+     free; otherwise attempt to free based on a heuristic. */
+  /* Note: in current implementation we don't keep the temp pointer separately
+     so avoid freeing here to prevent double-free. The malloc fallback was
+     removed in favor of writing headers directly, so there's nothing to free. */
 
   xSemaphoreGive(pcap_mutex);
   return ESP_OK;
@@ -448,15 +535,58 @@ static esp_err_t _pcap_flush_buffer_to_file_nolock() {
       if (written < buffer_offset) {
         ESP_LOGE(PCAP_TAG, "Failed to write buffered data to PCAP file.");
       }
-    } else { // If no file, write to UART
-      const char *mark_begin = "[BUF/BEGIN]";
-      const size_t mark_begin_len = strlen(mark_begin);
-      const char *mark_close = "[BUF/CLOSE]";
-      const size_t mark_close_len = strlen(mark_close);
+    } else { // If no file, try JIT mount for somethingsomething, else UART
+#ifdef CONFIG_BUILD_CONFIG_TEMPLATE
+      bool gating_template = (strcmp(CONFIG_BUILD_CONFIG_TEMPLATE, "somethingsomething") == 0);
+#else
+      bool gating_template = false;
+#endif
 
-      uart_write_bytes(UART_NUM_0, mark_begin, mark_begin_len);
-      uart_write_bytes(UART_NUM_0, (const char *)pcap_buffer, buffer_offset);
-      uart_write_bytes(UART_NUM_0, mark_close, mark_close_len);
+      if (gating_template) {
+        bool display_was_suspended = false;
+        if (sd_card_mount_for_flush(&display_was_suspended) == ESP_OK) {
+          if (pcap_file_path[0] == '\0') {
+            get_next_pcap_file_name(pcap_file_path, pcap_base_name);
+          }
+          FILE *f = fopen(pcap_file_path, "ab+");
+          if (f) {
+            fseek(f, 0, SEEK_END);
+            long sz = ftell(f);
+            if (sz == 0) {
+              // write global header on first write
+              pcap_write_global_header(f, s_capture_type);
+            }
+            size_t written = fwrite(pcap_buffer, 1, buffer_offset, f);
+            fclose(f);
+            if (written < buffer_offset) {
+              ESP_LOGE(PCAP_TAG, "Failed to write buffered data to PCAP file (JIT).");
+            }
+          }
+          sd_card_unmount_after_flush(display_was_suspended);
+        } else {
+          const char *mark_begin = "[BUF/BEGIN]";
+          const size_t mark_begin_len = strlen(mark_begin);
+          const char *mark_close = "[BUF/CLOSE]";
+          const size_t mark_close_len = strlen(mark_close);
+          glog_set_defer(1);
+          uart_write_bytes(UART_NUM_0, mark_begin, mark_begin_len);
+          uart_write_bytes(UART_NUM_0, (const char *)pcap_buffer, buffer_offset);
+          uart_write_bytes(UART_NUM_0, mark_close, mark_close_len);
+          glog_set_defer(0);
+          glog_flush_deferred();
+        }
+      } else {
+        const char *mark_begin = "[BUF/BEGIN]";
+        const size_t mark_begin_len = strlen(mark_begin);
+        const char *mark_close = "[BUF/CLOSE]";
+        const size_t mark_close_len = strlen(mark_close);
+        glog_set_defer(1);
+        uart_write_bytes(UART_NUM_0, mark_begin, mark_begin_len);
+        uart_write_bytes(UART_NUM_0, (const char *)pcap_buffer, buffer_offset);
+        uart_write_bytes(UART_NUM_0, mark_close, mark_close_len);
+        glog_set_defer(0);
+        glog_flush_deferred();
+      }
     }
     buffer_offset = 0; // Reset buffer
   }
@@ -472,6 +602,10 @@ esp_err_t pcap_flush_buffer_to_file() {
     xSemaphoreGive(pcap_mutex);
   }
   return ESP_OK;
+}
+
+bool pcap_is_capturing(void) {
+  return pcap_file != NULL;
 }
 
 void pcap_file_close() {
