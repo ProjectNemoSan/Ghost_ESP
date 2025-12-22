@@ -1,5 +1,177 @@
 # Ghost ESP Changelog
 
+## Revival v1.9
+
+### Added
+
+#### Display & UI
+- Added GhostLink display menu when connected to a peer with split view terminal showing normal/peer response logs
+- Added 'Invert Encoder' setting to display UI for configs with encoders
+- Added 9 new animations for the status display - @jaylikesbunda, @tototo31
+- Added support for wired screen mirroring
+- Added a first time boot setup wizard for display enabled configs
+
+#### NFC
+- Added Flipper Zero NFC parser compatibility layer with support for:
+  - Aime
+  - CSC Service Works
+  - WashCity (Verified working)
+  - Metromoney
+  - Bip
+  - CharlieCard
+  - Disney Infinity (Verified working)
+  - HI!
+  - HID PACS (Verified working)
+  - H World
+  - Kazan
+  - Microel
+  - MiZIP
+  - Plantain
+  - Saflok (Verified working)
+  - Skylanders (Verified working)
+  - SmartRider (Verified working)
+  - Social Moscow
+  - Troika
+  - Two Cities
+  - Umarsh
+  - Zolotaya Korona
+  - Zolotaya Korona Online
+- Added basic Mifare Desfire detection
+
+#### BLE
+- Added AirTag RSSI update logging so existing tags report RSSI changes every few seconds
+- Added GATT scanning, service scanning and RSSI tracking
+
+#### Wi-Fi & Networking
+- Added Ethernet support and docs - @tototo31
+- Added Ethernet Fingerprint scanning
+- Added Unique AP counter to wardriving summary
+- Added a Sweep scan to capture WiFi, BLE, GPS and 802154 data in a csv file on SD
+- Added RSSI tracking for selected APs and stations
+- Added OUI vendor lookup for access points and stations
+- Added drone detection and spoofing
+
+#### IR
+- Added IR CLI support
+- Added IR Dazzler functionality to pulse IR at 38kHz 95% duty load
+
+#### Core & CLI
+- Added CLI commands for changing the status display animations
+- Added command to set amount of RGB LEDs
+- Added SD Card CLI for control via WebSerial File Browser
+- Added a shared string for the firmware name and version number
+- Added JTAG support for ESP32C5
+- Added USB HID keyboard host support on ESP32-S3 devices for controlling the UI and inputting text
+- Added 'gpspin' command to set the GPS pin for recieving data
+
+#### Hardware
+- Added support for the RabbitLabs Poltergeist board
+- Added basic support for the Heltec v3 (NO LORA/MESH) - @tototo31
+
+#### Build & Docs
+- Add Docker support for HTML header generation with build script - @tototo31
+
+### Changed
+
+#### Display & UI
+- IR and NFC display views and popups now properly use active set UI theme
+- Standardized LVGL screen root creation across display views and added status-bar content offset GUI helpers
+- Grid menu now scrolls up and down instead of left and right
+- Reorganised the settings menu and adjusted styling
+- Minor keyboard view logic and styling refactor
+- Terminal enter/select now submits text if typed, otherwise opens keyboard view
+- Enable clock menu for all boards by using built-in ESP32 RTC and changed icon
+- Reorganised and renamed wifi display sections
+- Small improvements to encoder handling
+- Joystick Up/Down hold in options menus now auto-repeat
+
+#### NFC
+- Refactors to NFC logic to make more maintainable
+- After scanning, NFC popup title now specifies the tag type
+- Avoid redundant PN532 Mifare Classic reads for a minor speed up
+
+#### Wi-Fi & Networking
+- Changed WiGLE CSV header brand/model to report GhostESP and build template name
+- Added wardriving deduplication, WiGLE CSV v1.6 pre-header escaping, and improved C5 channel hopping
+- Free pcap queue and task when not capturing
+- Optimized multi-AP deauth by grouping targets by channel and reducing inter-frame delays
+- Added Pineapple OUI detection to existing Pineapple detection logic
+
+#### Core & CLI
+- Serial console UX improvements - @tototo31
+- Use Kconfig baud rate for UART instead of hardcoded 115200
+- Removed unused buffer to save 8KB RAM
+- Added shared MAC formatting helper for refactors
+- Added LVGL-safe helpers for NULL-safe object/timer deletion and scheduling
+- Miscellaneous small code refactors and improvements
+- Sync RTC time when a valid GPS fix is received
+- Renamed Dual Comm UI and documentation branding to GhostLink
+- Station scan now lists entries like AP scan results
+
+#### Hardware
+- Increase CPU clock speed on certain configs
+- Changed default CPU clock speed to 240MHz instead of 160MHz for:
+  - sdkconfig.awokimini
+  - sdkconfig.CYD2432S028R
+  - sdkconfig.CYD2USB
+  - sdkconfig.CYD2USB2.4Inch
+  - sdkconfig.CYD2USB2.4Inch_C_Varient
+  - sdkconfig.CYDDualUSB
+  - sdkconfig.CYDMicroUSB
+  - sdkconfig.default.esp32
+  - sdkconfig.default.esp2c5
+  - sdkconfig.default.esp2s2
+  - sdkconfig.flipper.jcmk_gps
+  - sdkconfig.JCMK_DevBoardPro
+  - sdkconfig.marauderv6
+  - sdkconfig.minion
+  - sdkconfig.poltergeist
+
+#### Build & Docs
+- Add vendor board support and images to documentation - @tototo31
+- Removed Flappy Ghost app and related build/docs references
+
+### Fixed
+
+#### Display & UI
+- Apps menu now follows main menu theme, controls and layout
+- Main menu app colors are now consistent across devices
+- Centralized UI theme palette definitions into a shared helper to reduce duplicate display code
+- Fixed a crash when entering SYM menu on keyboard view - @dagnazty
+- Fixed issues causing glitches with rainbow modes on certain devices and flicker when the RGB rainbow effect runs with power saving disabled
+- Fixed status bar not resetting from rainbow styling when switching RGB mode back to normal
+- Fixed apps menu not using the correct directions for joystick control
+- Fixed an issue with layout of more than 6 apps on the grid menu layout
+
+#### NFC
+- Fixed an issue that would cause MFC dictionary attack to not try all possible keys
+- Fixed an issue that would cause Chameleon Ultra to recover less keys than a PN532
+- Adjusted NTAG model detection to infer 213/215/216 from read length even when CC size byte is incorrect
+- Decoded NDEF URI fields so symbols like “@” display correctly
+
+#### BLE
+- Switched AirTag scanner to active BLE scanning for more reliable AirTag detection
+- Fixed BLE scanning not being reliable
+- Fixed crash after BLE deinit and during WiFi init
+- Fixed RAW BLE Capture not working
+
+#### Wi-Fi & Networking
+- Fixed wardriving WiGLE v1.6 CSV output formatting
+- Route evil portal HTML requests through the UART HTML buffer when active instead of the SD-backed file handler
+
+#### IR
+- Fixed IR send failing with long raw signals
+- Fixed IR learn remote popup Cancel button not responding
+
+#### Core & Hardware
+- Fixed issues with GPS and GhostLink UART being shared
+- Fixed gpsinfo display not logging anything when the GPS info task fails to start
+- Fixed an issue where setting RGB pins would fail on configs with no LEDs set
+- Debounce T-Deck trackball/keyboard I2C input
+- Wrapped power-management transitions with RGB pause/resume to prevent a crash
+- Fixed TEmbed C1101-specific hardware initialization running on all encoder configs
+- Raise sys event task size to prevent intermittent crashes
+
 ## Revival v1.8.1
 
 ### Added

@@ -3,10 +3,12 @@
 #include "managers/views/options_screen.h"
 #include "managers/views/terminal_screen.h"
 #include "managers/views/main_menu_screen.h"
+#include "gui/screen_layout.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "esp_timer.h"
 #include "esp_log.h"
+#include "gui/lvgl_safe.h"
 #include <string.h>
 #include <ctype.h>
 
@@ -25,7 +27,7 @@ static KeyboardSubmitCallback submit_callback = NULL;
 static bool is_caps = true;
 static bool is_symbols_mode = false;
 static bool is_capslock = false;
-#ifdef CONFIG_USE_ENCODER
+#if defined(CONFIG_USE_ENCODER) && !defined(CONFIG_USE_JOYSTICK)
 static lv_obj_t *encoder_cont = NULL;
 static lv_obj_t *encoder_labels[50];
 static const char *encoder_alpha_items[41] = {
@@ -51,6 +53,7 @@ static int encoder_offset_x = 0;
 static bool encoder_sym_mode = false;
 static bool encoder_uppercase = true;
 #endif
+
 static char placeholder[64] = "Enter text...";
 
 static bool styles_inited = false;
@@ -77,19 +80,18 @@ static lv_obj_t *key_btns[5][KEYBOARD_COLUMNS];
 static void init_keyboard_styles(void) {
     if (styles_inited) return;
     lv_style_init(&style_key_btn);
-    lv_style_set_bg_color(&style_key_btn, lv_color_hex(0x7B1FA2));
+    lv_style_set_bg_color(&style_key_btn, lv_color_hex(0xFFFFFF));
     lv_style_set_bg_opa(&style_key_btn, LV_OPA_COVER);
-    lv_style_set_border_color(&style_key_btn, lv_color_hex(0x444444));
+    lv_style_set_border_color(&style_key_btn, lv_color_hex(0x333333));
     lv_style_set_border_width(&style_key_btn, 1);
     lv_style_set_radius(&style_key_btn, 3);
 
     lv_style_init(&style_key_label);
-    lv_style_set_text_color(&style_key_label, lv_color_hex(0xFFFFFF));
+    lv_style_set_text_color(&style_key_label, lv_color_hex(0x000000));
     lv_style_set_text_font(&style_key_label, &lv_font_montserrat_14);
 
     styles_inited = true;
 }
-
 
 static const char *keys[][10] = {
     {"Q", "W", "E", "R", "T", "Y", "U", "I", "O", "P"},
@@ -126,6 +128,7 @@ static void activate_selected_key(void);
 static void keyboard_build_step(lv_timer_t *t);
 static void hide_all_key_buttons(void);
 static void reveal_row(int row);
+static void destroy_key_buttons(void);
 
 static lv_obj_t *pressed_key_btn = NULL;
 static lv_obj_t *selected_key_btn = NULL;
@@ -135,6 +138,8 @@ static lv_timer_t *keyboard_build_timer = NULL;
 static int keyboard_build_row = 0;
 static int keyboard_build_col = 0;
 static int keyboard_build_phase = 0; // 0=create buttons, 1=create labels
+// track which btnmatrix item is currently focused by joystick to manage CHECKED state
+static int joy_focused_btn_id = -1;
 
 static bool is_shift_key(const char *key) {
     return strcmp(key, "SHIFT") == 0;
@@ -172,8 +177,8 @@ static void style_shift_key(lv_obj_t *btn, lv_obj_t *label, bool capslock, bool 
         lv_obj_set_style_bg_color(btn, lv_color_hex(0xFFD600), 0);
         lv_obj_set_style_text_color(label, lv_color_hex(0x000000), 0);
     } else {
-        lv_obj_set_style_bg_color(btn, lv_color_hex(0x7B1FA2), 0);
-        lv_obj_set_style_text_color(label, lv_color_hex(0xFFFFFF), 0);
+        lv_obj_set_style_bg_color(btn, lv_color_hex(0xFFFFFF), 0);
+        lv_obj_set_style_text_color(label, lv_color_hex(0x000000), 0);
     }
 }
 
@@ -262,15 +267,16 @@ static lv_obj_t* create_key_button(lv_obj_t *parent, int x, int y, int w, int h,
 }
 
 static void submit_text() {
-    if (input_len > 0) {
-        if (submit_callback) {
-            submit_callback(input_buffer);
-        } else {
-            terminal_set_return_view(&options_menu_view);
-            display_manager_switch_view(&terminal_view);
-            vTaskDelay(pdMS_TO_TICKS(10));
-            simulateCommand(input_buffer);
-        }
+    if (submit_callback) {
+        submit_callback(input_buffer);
+        memset(input_buffer, 0, sizeof(input_buffer));
+        input_len = 0;
+        update_input_label();
+    } else if (input_len > 0) {
+        terminal_set_return_view(&options_menu_view);
+        display_manager_switch_view(&terminal_view);
+        vTaskDelay(pdMS_TO_TICKS(10));
+        simulateCommand(input_buffer);
         memset(input_buffer, 0, sizeof(input_buffer));
         input_len = 0;
         update_input_label();
@@ -292,7 +298,7 @@ static void add_char_to_buffer(char c) {
     if (is_caps && !is_capslock) {
         is_caps = false; // Reset to lowercase after any key press unless capslock is on
         update_key_labels(); // Update key labels to reflect the change
-        #ifdef CONFIG_USE_ENCODER
+        #if defined(CONFIG_USE_ENCODER) && !defined(CONFIG_USE_JOYSTICK)
         encoder_uppercase = (is_capslock || is_caps);
         if (encoder_cont && !encoder_sym_mode) {
             for (int j = 0; j < encoder_item_count; j++) {
@@ -368,7 +374,7 @@ static void update_key_labels() {
                             lv_label_set_text(key_label, "");
                             lv_obj_add_flag(key_btn, LV_OBJ_FLAG_HIDDEN);
                         }
-                        lv_obj_set_style_text_color(key_label, lv_color_hex(0xFFFFFF), 0);
+                        lv_obj_set_style_text_color(key_label, lv_color_hex(0x000000), 0);
                     }
                 }
             }
@@ -382,41 +388,29 @@ static void update_key_labels() {
 }
 
 static void recreate_keyboard_buttons() {
-#if defined(CONFIG_USE_TOUCHSCREEN)
+#if defined(CONFIG_USE_TOUCHSCREEN) || defined(CONFIG_USE_JOYSTICK)
     if (!root) return;
-    // For touch builds, just rebuild the btnmatrix map instead of recreating objects
+    // For touch/joystick builds, just rebuild the btnmatrix map instead of recreating objects
     build_key_matrix();
     return;
 #endif
 #if defined(CONFIG_USE_TOUCHSCREEN) || defined(CONFIG_USE_JOYSTICK)
     if (!root) return;
 
-    if (keyboard_build_timer) {
-        lv_timer_del(keyboard_build_timer);
-        keyboard_build_timer = NULL;
-    }
+    lvgl_timer_del_safe(&keyboard_build_timer);
     // hide the root during incremental rebuild to avoid heavy draw churn
     lv_obj_add_flag(root, LV_OBJ_FLAG_HIDDEN);
-    // reset build state and key button cache for rebuild
-    for (int rr = 0; rr < num_rows; rr++) {
-        for (int cc = 0; cc < KEYBOARD_COLUMNS; cc++) {
-            key_btns[rr][cc] = NULL;
-        }
-    }
+    destroy_key_buttons();
     keyboard_build_phase = 0;
     hide_all_key_buttons();
     keyboard_build_row = 0;
     keyboard_build_col = 0;
     keyboard_build_timer = lv_timer_create(keyboard_build_step, 10, NULL);
 #else
-    if (keyboard_build_timer) {
-        lv_timer_del(keyboard_build_timer);
-        keyboard_build_timer = NULL;
-    }
+    lvgl_timer_del_safe(&keyboard_build_timer);
     lv_obj_add_flag(root, LV_OBJ_FLAG_HIDDEN);
-    int screen_width = LV_HOR_RES;
     int screen_height = LV_VER_RES;
-    int status_bar_height = 20;
+    int status_bar_height = GUI_STATUS_BAR_HEIGHT;
     int display_height = 40;
     int padding = 5;
     int keys_start_y = status_bar_height + display_height + padding * 2;
@@ -431,7 +425,7 @@ static void recreate_keyboard_buttons() {
     }
 
     for (int r = 0; r < num_rows; r++) {
-        int total_key_width = screen_width - (padding * 2);
+        int total_key_width = LV_HOR_RES - (padding * 2);
         int current_row_length = max_row_lengths[r];
         int key_width = total_key_width / current_row_length;
         
@@ -506,9 +500,9 @@ static void recreate_keyboard_buttons() {
 static void keyboard_build_step(lv_timer_t *t) {
 #if defined(CONFIG_USE_TOUCHSCREEN) || defined(CONFIG_USE_JOYSTICK)
     if (!root || !lv_obj_is_valid(root)) { lv_timer_del(t); keyboard_build_timer = NULL; return; }
-    int screen_width = LV_HOR_RES;
+
     int screen_height = LV_VER_RES;
-    int status_bar_height = 20;
+    int status_bar_height = GUI_STATUS_BAR_HEIGHT;
     int display_height = 40;
     int padding = 5;
     int keys_start_y = status_bar_height + display_height + padding * 2;
@@ -603,6 +597,7 @@ static void keyboard_build_step(lv_timer_t *t) {
             cursor_row = 0;
             cursor_col = 0;
             apply_selection_highlight();
+
             // unhide root after build completes
             if (root) lv_obj_clear_flag(root, LV_OBJ_FLAG_HIDDEN);
             // restore radii after initial paint to re-enable rounded corners
@@ -624,27 +619,40 @@ static void keyboard_build_step(lv_timer_t *t) {
 #endif
 }
 
+static void destroy_key_buttons(void) {
+#if defined(CONFIG_USE_TOUCHSCREEN) || defined(CONFIG_USE_JOYSTICK)
+    for (int r = 0; r < num_rows; r++) {
+        for (int c = 0; c < KEYBOARD_COLUMNS; c++) {
+            lv_obj_t *btn = key_btns[r][c];
+            lvgl_obj_del_safe(&btn);
+            key_btns[r][c] = NULL;
+        }
+    }
+    pressed_key_btn = NULL;
+    selected_key_btn = NULL;
+#endif
+}
+
 static void keyboard_create() {
     is_caps = true; // Start in caps mode
     is_symbols_mode = false;
     input_len = 0;
     memset(input_buffer, 0, sizeof(input_buffer));
 
-    int screen_width = LV_HOR_RES;
     int screen_height = LV_VER_RES;
-    int status_bar_height = 20;
+    int status_bar_height = GUI_STATUS_BAR_HEIGHT;
 
-    root = lv_obj_create(lv_scr_act());
+    root = gui_screen_create_root(NULL, "Keyboard", lv_color_hex(0x121212), LV_OPA_COVER);
     keyboard_view.root = root;
     lv_obj_remove_style_all(root);
-    lv_obj_set_size(root, screen_width, screen_height);
+    lv_obj_set_size(root, LV_HOR_RES, screen_height);
     lv_obj_set_style_bg_color(root, lv_color_hex(0x121212), 0);
     lv_obj_set_style_bg_opa(root, LV_OPA_COVER, 0);
 
     int padding = 5;
     int display_height = 40;
     input_label = lv_label_create(root);
-    lv_obj_set_size(input_label, screen_width - 2 * padding, display_height - 2 * padding);
+    lv_obj_set_size(input_label, LV_HOR_RES - 2 * padding, display_height - 2 * padding);
     lv_obj_set_style_bg_color(input_label, lv_color_hex(0x1E1E1E), 0);
     lv_obj_set_style_bg_opa(input_label, LV_OPA_COVER, 0);
     lv_obj_set_style_text_color(input_label, lv_color_hex(0xFFFFFF), 0);
@@ -673,13 +681,13 @@ static void keyboard_create() {
     }
     keyboard_build_phase = 0;
 
-#if defined(CONFIG_USE_TOUCHSCREEN)
-    // use a single btnmatrix to render the keyboard for touch builds
-    build_key_matrix();
-#elif defined(CONFIG_USE_ENCODER)
+#if defined(CONFIG_USE_TOUCHSCREEN) || defined(CONFIG_USE_JOYSTICK)
+    // use a single btnmatrix to render the keyboard for touch/joystick builds
+    recreate_keyboard_buttons();
+#elif defined(CONFIG_USE_ENCODER) && !defined(CONFIG_USE_JOYSTICK)
     encoder_cont = lv_obj_create(root);
     lv_obj_remove_style_all(encoder_cont);
-    lv_obj_set_size(encoder_cont, screen_width, display_height);
+    lv_obj_set_size(encoder_cont, LV_HOR_RES, display_height);
     lv_obj_set_pos(encoder_cont, 0, status_bar_height + display_height + padding);
     lv_obj_set_style_bg_opa(encoder_cont, LV_OPA_TRANSP, 0);
     // initialize encoder items and metrics
@@ -687,13 +695,13 @@ static void keyboard_create() {
     encoder_item_count = encoder_alpha_count;
     encoder_sym_mode = false;
     encoder_sel_idx = 0;
-    encoder_screen_width = screen_width;
+    encoder_screen_width = LV_HOR_RES;
     encoder_item_spacing = display_height;
-    encoder_offset_x = (screen_width / 2) - (encoder_item_spacing / 2);
+    encoder_offset_x = (encoder_screen_width / 2) - (encoder_item_spacing / 2);
     lv_obj_set_scroll_dir(encoder_cont, LV_DIR_LEFT | LV_DIR_RIGHT);
     lv_obj_set_scrollbar_mode(encoder_cont, LV_SCROLLBAR_MODE_OFF);
     // pad right to allow last items to center
-    lv_obj_set_style_pad_right(encoder_cont, screen_width, 0);
+    lv_obj_set_style_pad_right(encoder_cont, encoder_screen_width, 0);
     // create and position each item label (centered, avoid clipping)
     for(int i = 0; i < encoder_item_count; i++) {
         encoder_labels[i] = lv_label_create(encoder_cont);
@@ -748,12 +756,9 @@ static void keyboard_create() {
 
 static void keyboard_destroy() {
     if (keyboard_view.root) {
-        if (keyboard_build_timer) {
-            lv_timer_del(keyboard_build_timer);
-            keyboard_build_timer = NULL;
-        }
-        lv_obj_del(keyboard_view.root);
-        keyboard_view.root = NULL;
+        lvgl_timer_del_safe(&keyboard_build_timer);
+        destroy_key_buttons();
+        lvgl_obj_del_safe(&keyboard_view.root);
         root = NULL;
         key_matrix = NULL;
         shift_btn_id = -1;
@@ -765,7 +770,7 @@ static void keyboard_destroy() {
         is_symbols_mode = false;
         is_caps = true;
         is_capslock = false;
-#ifdef CONFIG_USE_ENCODER
+#if defined(CONFIG_USE_ENCODER) && !defined(CONFIG_USE_JOYSTICK)
         encoder_cont = NULL;
         encoder_item_count = 0;
         encoder_screen_width = 0;
@@ -775,12 +780,15 @@ static void keyboard_destroy() {
         selected_key_btn = NULL;
         cursor_row = 0;
         cursor_col = 0;
+        joy_focused_btn_id = -1;
     }
 }
 
 static void handle_hardware_button_press_keyboard(InputEvent *event) {
-#ifdef CONFIG_USE_ENCODER
+
+#if defined(CONFIG_USE_ENCODER) && !defined(CONFIG_USE_JOYSTICK)
     if (event->type == INPUT_TYPE_ENCODER) {
+        if (!encoder_cont) return;
         int dir = event->data.encoder.direction;
         int prev = encoder_sel_idx;
         encoder_sel_idx = (encoder_sel_idx + dir + encoder_item_count) % encoder_item_count;
@@ -866,6 +874,8 @@ static void handle_hardware_button_press_keyboard(InputEvent *event) {
         const int *row_lens = get_current_row_lengths();
         int prev_row = cursor_row;
         int prev_col = cursor_col;
+
+        // Update virtual cursor position
         if (button == 0) { // left
             if (cursor_col > 0) cursor_col--; else cursor_col = row_lens[cursor_row] - 1;
         } else if (button == 3) { // right
@@ -876,10 +886,44 @@ static void handle_hardware_button_press_keyboard(InputEvent *event) {
         } else if (button == 4) { // down
             cursor_row = (cursor_row < num_rows - 1) ? cursor_row + 1 : 0;
             if (cursor_col >= row_lens[cursor_row]) cursor_col = row_lens[cursor_row] - 1;
-        } else if (button == 1) { // select
+        }
+
+        ensure_valid_cursor();
+
+#if defined(CONFIG_USE_TOUCHSCREEN) || defined(CONFIG_USE_JOYSTICK)
+        if (key_matrix) {
+            // Map (cursor_row, cursor_col) to btnmatrix button index
+            const int *lens = get_current_row_lengths();
+            int id = 0;
+            for (int r = 0; r < cursor_row; r++) {
+                id += lens[r];
+            }
+            id += cursor_col;
+            // make sure btnmatrix selection matches joystick focus so events see this key
+            lv_btnmatrix_set_selected_btn(key_matrix, id);
+            // clear previous joystick highlight if any
+            if (joy_focused_btn_id >= 0 && joy_focused_btn_id != id) {
+                // don't clear SHIFT's CHECKED state when it's indicating caps/capslock
+                bool shift_caps_active = (joy_focused_btn_id == shift_btn_id) && (is_caps || is_capslock);
+                if (!shift_caps_active) {
+                    lv_btnmatrix_clear_btn_ctrl(key_matrix, joy_focused_btn_id, LV_BTNMATRIX_CTRL_CHECKED);
+                }
+            }
+            joy_focused_btn_id = id;
+            // mark current key as CHECKED so it uses inverted colors
+            lv_btnmatrix_set_btn_ctrl(key_matrix, id, LV_BTNMATRIX_CTRL_CHECKED);
+            if (button == 1) { // select -> trigger same path as touch
+                lv_event_send(key_matrix, LV_EVENT_VALUE_CHANGED, NULL);
+            }
+            return;
+        }
+#endif
+
+        if (button == 1) { // select fallback when no btnmatrix is present
             activate_selected_key();
             return;
         }
+
         if (prev_row != cursor_row || prev_col != cursor_col) {
             apply_selection_highlight();
         }
@@ -1026,7 +1070,7 @@ static void handle_hardware_button_press_keyboard(InputEvent *event) {
             lv_obj_t *key_label = lv_obj_get_child(pressed_key_btn, 0);
             const char *label_text = lv_label_get_text(key_label);
             if (strcmp(label_text, LV_SYMBOL_UP) != 0) {
-                lv_obj_set_style_bg_color(pressed_key_btn, lv_color_hex(0x7B1FA2), 0);
+                lv_obj_set_style_bg_color(pressed_key_btn, lv_color_hex(0xFFFFFF), 0);
             }
             pressed_key_btn = NULL;
             // Always update key labels to refresh SHIFT key highlight
@@ -1084,7 +1128,7 @@ View keyboard_view = {
 };
 
 static void key_matrix_event_cb(lv_event_t *e) {
-#if defined(CONFIG_USE_TOUCHSCREEN)
+#if defined(CONFIG_USE_TOUCHSCREEN) || defined(CONFIG_USE_JOYSTICK)
     lv_obj_t *m = lv_event_get_target(e);
     if (!m) return;
     if (lv_event_get_code(e) != LV_EVENT_VALUE_CHANGED) return;
@@ -1121,7 +1165,8 @@ static void key_matrix_event_cb(lv_event_t *e) {
             c = (is_capslock || is_caps) ? (char)toupper((unsigned char)c) : (char)tolower((unsigned char)c);
         }
         add_char_to_buffer_raw(c);
-        if (is_caps && !is_capslock) {
+        // Only reset temporary SHIFT/caps and rebuild when in alpha mode; symbols shouldn't rebuild
+        if (!is_symbols_mode && is_caps && !is_capslock) {
             is_caps = false;
             build_key_matrix();
         }
@@ -1132,7 +1177,7 @@ static void key_matrix_event_cb(lv_event_t *e) {
 }
 
 static void build_key_matrix(void) {
-#if defined(CONFIG_USE_TOUCHSCREEN)
+#if defined(CONFIG_USE_TOUCHSCREEN) || defined(CONFIG_USE_JOYSTICK)
     if (!root) return;
     int screen_width = LV_HOR_RES;
     int screen_height = LV_VER_RES;
@@ -1204,26 +1249,29 @@ static void build_key_matrix(void) {
                 if (strcmp(src, "SHIFT") == 0 || strcmp(src, "DEL") == 0 || strcmp(src, " ") == 0) w = 2;
             }
             lv_btnmatrix_set_btn_width(key_matrix, id, w);
+            // clear any stale CHECKED state from previous layouts before marking as checkable
+            lv_btnmatrix_clear_btn_ctrl(key_matrix, id, LV_BTNMATRIX_CTRL_CHECKED);
+            lv_btnmatrix_set_btn_ctrl(key_matrix, id, LV_BTNMATRIX_CTRL_CHECKABLE);
             id++;
         }
     }
 
     if (shift_btn_id >= 0) {
-        lv_btnmatrix_set_btn_ctrl(key_matrix, shift_btn_id, LV_BTNMATRIX_CTRL_CHECKABLE | LV_BTNMATRIX_CTRL_CLICK_TRIG);
-        if (is_caps || is_capslock) lv_btnmatrix_set_btn_ctrl(key_matrix, shift_btn_id, LV_BTNMATRIX_CTRL_CHECKED);
-        else lv_btnmatrix_clear_btn_ctrl(key_matrix, shift_btn_id, LV_BTNMATRIX_CTRL_CHECKED);
+        // SHIFT is click-triggered and also reflects caps/capslock state via CHECKED (inverted colors)
+        lv_btnmatrix_set_btn_ctrl(key_matrix, shift_btn_id,
+                                  LV_BTNMATRIX_CTRL_CHECKABLE | LV_BTNMATRIX_CTRL_CLICK_TRIG);
+        if (is_caps || is_capslock) {
+            lv_btnmatrix_set_btn_ctrl(key_matrix, shift_btn_id, LV_BTNMATRIX_CTRL_CHECKED);
+        }
     }
 
-    if (is_capslock) {
-        lv_obj_set_style_bg_color(key_matrix, lv_color_hex(0x00BFFF), LV_PART_ITEMS | LV_STATE_CHECKED);
-        lv_obj_set_style_text_color(key_matrix, lv_color_hex(0xFFFFFF), LV_PART_ITEMS | LV_STATE_CHECKED);
-    } else if (is_caps) {
-        lv_obj_set_style_bg_color(key_matrix, lv_color_hex(0xFFD600), LV_PART_ITEMS | LV_STATE_CHECKED);
-        lv_obj_set_style_text_color(key_matrix, lv_color_hex(0x000000), LV_PART_ITEMS | LV_STATE_CHECKED);
-    } else {
-        lv_obj_set_style_bg_color(key_matrix, lv_color_hex(0x7B1FA2), LV_PART_ITEMS | LV_STATE_DEFAULT);
-        lv_obj_set_style_text_color(key_matrix, lv_color_hex(0xFFFFFF), LV_PART_ITEMS | LV_STATE_DEFAULT);
-    }
+    lv_obj_set_style_bg_color(key_matrix, lv_color_hex(0xFFFFFF), LV_PART_ITEMS | LV_STATE_DEFAULT);
+    lv_obj_set_style_text_color(key_matrix, lv_color_hex(0x000000), LV_PART_ITEMS | LV_STATE_DEFAULT);
+    lv_obj_set_style_bg_color(key_matrix, lv_color_hex(0x000000), LV_PART_ITEMS | LV_STATE_CHECKED);
+    lv_obj_set_style_text_color(key_matrix, lv_color_hex(0xFFFFFF), LV_PART_ITEMS | LV_STATE_CHECKED);
+
+    // any rebuild invalidates previous focus id; it will be re-established on next joystick move
+    joy_focused_btn_id = -1;
 
     if (radius_override_active) {
         lv_style_set_radius(&style_key_btn, saved_key_radius);
@@ -1303,8 +1351,8 @@ static lv_obj_t *get_key_button_at(int row, int col) {
 
 static void apply_selection_highlight(void) {
     if (!root) return;
-#if defined(CONFIG_USE_TOUCHSCREEN)
-    if (key_matrix) return; // btnmatrix handles its own visuals on touch builds
+#if defined(CONFIG_USE_TOUCHSCREEN) || defined(CONFIG_USE_JOYSTICK)
+    if (key_matrix) return; // btnmatrix handles its own visuals on touch/joystick builds
 #endif
     ensure_valid_cursor();
     // reset all key borders to default
@@ -1316,7 +1364,7 @@ static void apply_selection_highlight(void) {
             if ((uint32_t)child_idx < child_count) {
                 lv_obj_t *btn = lv_obj_get_child(root, child_idx);
                 if (btn) {
-                    lv_obj_set_style_border_color(btn, lv_color_hex(0x444444), 0);
+                    lv_obj_set_style_border_color(btn, lv_color_hex(0x666666), 0);
                     lv_obj_set_style_border_width(btn, 1, 0);
                 }
             }
@@ -1326,7 +1374,7 @@ static void apply_selection_highlight(void) {
     // highlight current cursor key
     lv_obj_t *btn = get_key_button_at(cursor_row, cursor_col);
     if (btn) {
-        lv_obj_set_style_border_color(btn, lv_color_hex(0xFFFFFF), 0);
+        lv_obj_set_style_border_color(btn, lv_color_hex(0x00BFFF), 0);
         lv_obj_set_style_border_width(btn, 2, 0);
         selected_key_btn = btn;
     } else {

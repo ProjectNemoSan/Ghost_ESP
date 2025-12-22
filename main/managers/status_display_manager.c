@@ -10,13 +10,17 @@
 #include <stdio.h>
 
 #include "driver/i2c.h"
+#include "driver/gpio.h"
+#include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_system.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include "freertos/timers.h"
+#include "freertos/task.h"
 #include "i2c_bus_lock.h"
 #include "managers/settings_manager.h"
+#include "managers/status_display_animations.h"
 
 static esp_err_t status_display_send(uint8_t control, const uint8_t *data, size_t len);
 
@@ -25,55 +29,39 @@ static esp_err_t status_display_send(uint8_t control, const uint8_t *data, size_
 #define STATUS_CMD 0x00
 #define STATUS_DATA 0x40
 
+#if CONFIG_STATUS_DISPLAY_ROTATE_180
+#define STATUS_SEGMENT_REMAP_CMD 0xA1
+#define STATUS_COM_SCAN_CMD 0xC8
+#else
+#define STATUS_SEGMENT_REMAP_CMD 0xA0
+#define STATUS_COM_SCAN_CMD 0xC0
+#endif
+
 static const char *TAG = "StatusDisplay";
 
 static SemaphoreHandle_t s_mutex;
 static bool s_ready;
 static bool s_i2c_configured;
 static bool s_i2c_installed;
-static uint8_t s_buffer[128 * 8];
+static uint8_t *s_buffer;
+#define STATUS_BUFFER_SIZE (128 * 8)
 static char s_line1[24];
 static char s_line2[24];
 static const int SCALE_Y = 2; // simple vertical scaling factor
+#if defined(CONFIG_USE_IO_EXPANDER)
+static TickType_t s_next_flush_allowed_tick;
+static const TickType_t STATUS_DISPLAY_MIN_FLUSH_INTERVAL_TICKS = pdMS_TO_TICKS(200);
+#endif
 // idle animation settings
 static TimerHandle_t s_idle_timer;
 static TickType_t s_last_update_tick;
-static const TickType_t ANIM_INTERVAL_TICKS = pdMS_TO_TICKS(500);  // 500 ms
-
-static bool status_idle_delay_elapsed(TickType_t now)
-{
-    uint32_t timeout_ms = settings_get_status_idle_timeout_ms(&G_Settings);
-    if (timeout_ms == 0 || timeout_ms == UINT32_MAX) {
-        return false; // never start
-    }
-    TickType_t required = pdMS_TO_TICKS(timeout_ms);
-    return (now - s_last_update_tick) >= required;
-}
+static const TickType_t ANIM_INTERVAL_TICKS = pdMS_TO_TICKS(150);
 static int s_anim_frame;
 static TaskHandle_t s_anim_task;
 static TickType_t s_next_anim_allowed_tick;
+static TickType_t s_oom_backoff_until;
+static bool s_oom_logged;
 // static int s_i2c_error_streak; // unused
-
-// conway's life state
-#define LIFE_COLS 32
-#define LIFE_ROWS 16
-#define LIFE_CELL_SIZE 4
-static uint8_t s_life_grid[LIFE_ROWS][LIFE_COLS];
-static uint8_t s_life_next[LIFE_ROWS][LIFE_COLS];
-static bool s_life_active;
-// ghost sprite (24x30), 1bpp, row-major MSB-first
-static const int GHOST_W = 24;
-static const int GHOST_H = 30;
-static const uint8_t ghostidle_bits[] = {
-    0x00, 0x3f, 0x00, 0x00, 0xc0, 0xc0, 0x01, 0x00, 0x20, 0x02, 0x00, 0x10, 0x02, 0x00, 0x10, 0x02,
-    0x00, 0x08, 0x02, 0x0c, 0xc8, 0x02, 0x0c, 0xc8, 0x04, 0x1c, 0xc8, 0x04, 0x00, 0x08, 0x04, 0x01,
-    0x88, 0x04, 0x03, 0x88, 0x04, 0x00, 0x08, 0x04, 0x1c, 0x0e, 0x04, 0x62, 0x31, 0x08, 0x82, 0x41,
-    0x08, 0x0c, 0x02, 0x08, 0x30, 0x0c, 0x10, 0x40, 0x30, 0x10, 0x00, 0x10, 0x10, 0x00, 0x10, 0x10,
-    0x00, 0x20, 0x20, 0x00, 0x40, 0x20, 0x01, 0x80, 0x4e, 0x06, 0x00, 0xf1, 0xf0, 0x00, 0x00, 0x00,
-    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x0f, 0xff, 0x80
-};
-static int s_ghost_x;
-static int s_ghost_dir = 1; // 1:right, -1:left
 
 static const uint8_t font_5x7[][5] = {
     {0x00,0x00,0x00,0x00,0x00}, {0x00,0x00,0x5f,0x00,0x00}, {0x00,0x07,0x00,0x07,0x00},
@@ -112,15 +100,34 @@ static const uint8_t font_5x7[][5] = {
 
 static esp_err_t status_display_send(uint8_t control, const uint8_t *data, size_t len) {
     if (!data || !len) return ESP_OK;
+    TickType_t now = xTaskGetTickCount();
+    if (s_oom_backoff_until && now < s_oom_backoff_until) {
+        return ESP_ERR_NO_MEM;
+    }
     i2c_cmd_handle_t cmd = i2c_cmd_link_create();
+    if (!cmd) {
+        if (!s_oom_logged) {
+            ESP_LOGW(TAG, "i2c_cmd_link_create failed (OOM), backing off");
+            s_oom_logged = true;
+        }
+        s_oom_backoff_until = now + pdMS_TO_TICKS(2000);
+        return ESP_ERR_NO_MEM;
+    }
+    s_oom_backoff_until = 0;
+    s_oom_logged = false;
     i2c_master_start(cmd);
     i2c_master_write_byte(cmd, (STATUS_DISPLAY_ADDR << 1) | I2C_MASTER_WRITE, true);
     i2c_master_write_byte(cmd, control, true);
     i2c_master_write(cmd, (uint8_t *)data, len, true);
     i2c_master_stop(cmd);
     bool locked = i2c_bus_lock(STATUS_DISPLAY_I2C_PORT, 120);
+    if (!locked) {
+        i2c_cmd_link_delete(cmd);
+        ESP_LOGW(TAG, "status display i2c busy, skipping ctrl=0x%02X", control);
+        return ESP_ERR_TIMEOUT;
+    }
     esp_err_t err = i2c_master_cmd_begin(STATUS_DISPLAY_I2C_PORT, cmd, pdMS_TO_TICKS(100));
-    if (locked) i2c_bus_unlock(STATUS_DISPLAY_I2C_PORT);
+    i2c_bus_unlock(STATUS_DISPLAY_I2C_PORT);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "i2c write failed ctrl=0x%02X len=%u err=%s", control, (unsigned)len, esp_err_to_name(err));
     } else {
@@ -135,20 +142,32 @@ static esp_err_t status_display_write_command(uint8_t command) {
 }
 
 static void status_display_flush(void) {
+    if (!s_buffer) return;
+#if defined(CONFIG_USE_IO_EXPANDER)
+    TickType_t now = xTaskGetTickCount();
+    if (now < s_next_flush_allowed_tick) {
+        return;
+    }
+    s_next_flush_allowed_tick = now + STATUS_DISPLAY_MIN_FLUSH_INTERVAL_TICKS;
+#endif
     for (uint8_t page = 0; page < 8; ++page) {
         uint8_t setup[] = { (uint8_t)(0xB0 | page), 0x00, 0x10 };
         if (status_display_send(STATUS_CMD, setup, sizeof(setup)) != ESP_OK) return;
         const uint8_t *chunk = &s_buffer[page * 128];
         if (status_display_send(STATUS_DATA, chunk, 128) != ESP_OK) return;
+#if defined(CONFIG_USE_IO_EXPANDER)
+        // brief pause lets other IO expander clients grab the bus between 1kB bursts
+        vTaskDelay(pdMS_TO_TICKS(5));
+#endif
     }
 }
 
 static void status_display_clear_buffer(void) {
-    memset(s_buffer, 0, sizeof(s_buffer));
+    if (s_buffer) memset(s_buffer, 0, STATUS_BUFFER_SIZE);
 }
 
 static void status_display_plot_pixel(int x, int y, bool on) {
-    if (x < 0 || x >= 128 || y < 0 || y >= 64) return;
+    if (!s_buffer || x < 0 || x >= 128 || y < 0 || y >= 64) return;
     int index = x + (y / 8) * 128;
     uint8_t bit = 1u << (y & 7);
     if (on) s_buffer[index] |= bit; else s_buffer[index] &= (uint8_t)~bit;
@@ -164,6 +183,26 @@ static void status_display_draw_char(int x, int y, char c) {
             // scale vertically by drawing multiple rows per bit
             for (int sy = 0; sy < SCALE_Y; ++sy) {
                 status_display_plot_pixel(x + col, y + row * SCALE_Y + sy, on);
+            }
+        }
+    }
+}
+
+static void status_display_draw_char_rot90_right(int x, int y, char c)
+{
+    if (c < 32 || c > 126) c = ' ';
+    const uint8_t *glyph = font_5x7[(int)c - 32];
+    const int w = 5;
+    const int h = 7;
+    for (int col = 0; col < w; ++col) {
+        uint8_t column = glyph[col];
+        for (int row = 0; row < h; ++row) {
+            bool on = (column >> row) & 0x01;
+            if (!on) continue;
+            int X = x + (h - 1 - row);
+            int Y = y + col * SCALE_Y;
+            for (int sy = 0; sy < SCALE_Y; ++sy) {
+                status_display_plot_pixel(X, Y + sy, true);
             }
         }
     }
@@ -207,37 +246,45 @@ static void status_display_render(const char *line_one, const char *line_two) {
     xSemaphoreGive(s_mutex);
 }
 
-static void draw_sprite_msb(int x, int y, const uint8_t *bits, int w, int h, bool flip_h)
+static void anim_clear(void *user)
 {
-    // bits are packed MSB-first per byte, row-major left-to-right
-    int bytes_per_row = (w + 7) / 8;
-    for (int row = 0; row < h; ++row) {
-        const uint8_t *rowptr = bits + row * bytes_per_row;
-        for (int col = 0; col < w; ++col) {
-            int byte_idx = col >> 3;
-            int bit_idx = 7 - (col & 7);
-            bool on = ((rowptr[byte_idx] >> bit_idx) & 1) != 0;
-            if (!on) continue;
-            int draw_x = flip_h ? (x + (w - 1 - col)) : (x + col);
-            status_display_plot_pixel(draw_x, y + row, true);
-        }
-    }
+    (void)user;
+    status_display_clear_buffer();
 }
 
-// draw an idle animation frame (a moving dot on the bottom row) - unused
-// static void status_display_draw_idle_frame(void) {
-//     if (!s_ready) return;
-//     if (xSemaphoreTake(s_mutex, pdMS_TO_TICKS(100)) != pdTRUE) return;
-//     // preserve current lines while drawing animation
-//     status_display_render_locked(s_line1, s_line2);
-//     // draw dot at bottom row
-//     int y = 64 - 2; // near bottom
-//     int range = 120; // travel range
-//     int x = 4 + (s_anim_frame % range);
-//     status_display_plot_pixel(x, y, true);
-//     status_display_flush();
-//     xSemaphoreGive(s_mutex);
-// }
+static void anim_flush(void *user)
+{
+    (void)user;
+    status_display_flush();
+}
+
+static void anim_plot_pixel(void *user, int x, int y, bool on)
+{
+    (void)user;
+    status_display_plot_pixel(x, y, on);
+}
+
+static void anim_draw_text(void *user, int x, int y, const char *text)
+{
+    (void)user;
+    status_display_draw_text(x, y, text);
+}
+
+static void anim_draw_char_rot90_right(void *user, int x, int y, char c)
+{
+    (void)user;
+    status_display_draw_char_rot90_right(x, y, c);
+}
+
+static bool status_idle_delay_elapsed(TickType_t now)
+{
+    uint32_t timeout_ms = settings_get_status_idle_timeout_ms(&G_Settings);
+    if (timeout_ms == 0 || timeout_ms == UINT32_MAX) {
+        return false;
+    }
+    TickType_t required = pdMS_TO_TICKS(timeout_ms);
+    return (now - s_last_update_tick) >= required;
+}
 
 static void status_display_idle_timer_cb(TimerHandle_t t) {
     (void)t;
@@ -253,87 +300,33 @@ static void status_display_anim_task(void *arg) {
         ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
         TickType_t now = xTaskGetTickCount();
         if (!status_idle_delay_elapsed(now)) {
-            s_life_active = false;
+            status_display_animations_reset();
             continue;
         }
         if (now < s_next_anim_allowed_tick) continue;
         s_next_anim_allowed_tick = now + ANIM_INTERVAL_TICKS;
 
-        if (settings_get_status_idle_animation(&G_Settings) == IDLE_ANIM_GAME_OF_LIFE) {
-            if (!s_life_active) {
-                uint32_t seed = (uint32_t)now;
-                seed ^= (uint32_t)((uintptr_t)&now);
-                seed = seed * 1664525u + 1013904223u;
-                for (int r = 0; r < LIFE_ROWS; ++r) {
-                    for (int c = 0; c < LIFE_COLS; ++c) {
-                        seed = seed * 1664525u + 1013904223u;
-                        s_life_grid[r][c] = (seed >> 28) & 1;
-                    }
-                }
-                s_life_active = true;
-            } else {
-                for (int r = 0; r < LIFE_ROWS; ++r) {
-                    for (int c = 0; c < LIFE_COLS; ++c) {
-                        int live_neighbors = 0;
-                        for (int dr = -1; dr <= 1; ++dr) {
-                            for (int dc = -1; dc <= 1; ++dc) {
-                                if (dr == 0 && dc == 0) continue;
-                                int rr = (r + dr + LIFE_ROWS) % LIFE_ROWS;
-                                int cc = (c + dc + LIFE_COLS) % LIFE_COLS;
-                                live_neighbors += s_life_grid[rr][cc] ? 1 : 0;
-                            }
-                        }
-                        if (s_life_grid[r][c]) {
-                            s_life_next[r][c] = (live_neighbors == 2 || live_neighbors == 3) ? 1 : 0;
-                        } else {
-                            s_life_next[r][c] = (live_neighbors == 3) ? 1 : 0;
-                        }
-                    }
-                }
-                for (int r = 0; r < LIFE_ROWS; ++r) memcpy(s_life_grid[r], s_life_next[r], LIFE_COLS);
-            }
-        } else {
-            // ghost sprite horizontal walk with gentle vertical float
-            int speed = 4; // pixels per tick
-            if (s_ghost_dir > 0) {
-                s_ghost_x += speed;
-                if (s_ghost_x + GHOST_W >= 128) { s_ghost_x = 128 - GHOST_W; s_ghost_dir = -1; }
-            } else {
-                s_ghost_x -= speed;
-                if (s_ghost_x <= 0) { s_ghost_x = 0; s_ghost_dir = 1; }
-            }
-        }
+        s_anim_frame++;
+
+        IdleAnimation anim = settings_get_status_idle_animation(&G_Settings);
 
         if (xSemaphoreTake(s_mutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+            StatusAnimGfx gfx = {
+                .clear = anim_clear,
+                .flush = anim_flush,
+                .plot_pixel = anim_plot_pixel,
+                .draw_text = anim_draw_text,
+                .draw_char_rot90_right = anim_draw_char_rot90_right,
+                .width = 128,
+                .height = 64,
+                .scale_y = SCALE_Y,
+                .font_char_width = 5,
+                .font_char_height = 7,
+                .user = NULL,
+            };
+
             status_display_clear_buffer();
-            if (settings_get_status_idle_animation(&G_Settings) == IDLE_ANIM_GAME_OF_LIFE) {
-                for (int r = 0; r < LIFE_ROWS; ++r) {
-                    for (int c = 0; c < LIFE_COLS; ++c) {
-                        if (!s_life_grid[r][c]) continue;
-                        int sx = c * LIFE_CELL_SIZE;
-                        int sy = r * LIFE_CELL_SIZE;
-                        for (int yy = 0; yy < LIFE_CELL_SIZE; ++yy) {
-                            for (int xx = 0; xx < LIFE_CELL_SIZE; ++xx) {
-                                status_display_plot_pixel(sx + xx, sy + yy, true);
-                            }
-                        }
-                    }
-                }
-            } else {
-                bool flip = (s_ghost_dir < 0);
-                // vertical float: sine-like using a small lookup via s_anim_frame
-                // amplitude 6px, base line near bottom
-                int base_y = 64 - GHOST_H - 6;
-                if (base_y < 0) base_y = 0;
-                int phase = s_anim_frame & 0x1F; // 0..31
-                // cheap triangle wave: 0..6..0..-6..0
-                int tri = phase < 16 ? phase : (32 - phase);
-                int y_offset = tri - 8; // -8..7 approx
-                if (y_offset < -6) y_offset = -6;
-                if (y_offset > 6) y_offset = 6;
-                int y = base_y + y_offset;
-                draw_sprite_msb(s_ghost_x, y, ghostidle_bits, GHOST_W, GHOST_H, flip);
-            }
+            status_display_animations_step(anim, now, s_anim_frame, &gfx);
             status_display_flush();
             xSemaphoreGive(s_mutex);
         }
@@ -356,10 +349,48 @@ void status_display_init(void) {
 
     ESP_LOGI(TAG, "initializing status display on I2C port %d addr 0x%02X", STATUS_DISPLAY_I2C_PORT, STATUS_DISPLAY_ADDR);
 
+    // Configure power control pin (Vext) if specified
+#if CONFIG_STATUS_DISPLAY_POWER_PIN >= 0
+    gpio_reset_pin(CONFIG_STATUS_DISPLAY_POWER_PIN);
+    gpio_set_direction(CONFIG_STATUS_DISPLAY_POWER_PIN, GPIO_MODE_OUTPUT);
+    // Set LOW to power on display (Heltec V3 Vext pin behavior)
+    gpio_set_level(CONFIG_STATUS_DISPLAY_POWER_PIN, 0);
+    vTaskDelay(pdMS_TO_TICKS(10)); // Small delay for power to stabilize
+    ESP_LOGI(TAG, "power control pin %d set LOW (display ON)", CONFIG_STATUS_DISPLAY_POWER_PIN);
+#endif
+
+    // Configure reset pin if specified
+#if CONFIG_STATUS_DISPLAY_RESET_PIN >= 0
+    gpio_reset_pin(CONFIG_STATUS_DISPLAY_RESET_PIN);
+    gpio_set_direction(CONFIG_STATUS_DISPLAY_RESET_PIN, GPIO_MODE_OUTPUT);
+    // Reset sequence: LOW -> delay -> HIGH
+    gpio_set_level(CONFIG_STATUS_DISPLAY_RESET_PIN, 0);
+    vTaskDelay(pdMS_TO_TICKS(10));
+    gpio_set_level(CONFIG_STATUS_DISPLAY_RESET_PIN, 1);
+    vTaskDelay(pdMS_TO_TICKS(10));
+    ESP_LOGI(TAG, "reset pin %d sequence completed", CONFIG_STATUS_DISPLAY_RESET_PIN);
+#endif
+
     if (!s_mutex) {
         s_mutex = xSemaphoreCreateMutex();
         if (!s_mutex) {
             ESP_LOGE(TAG, "failed to create mutex");
+            return;
+        }
+    }
+
+    if (!s_buffer) {
+#if CONFIG_SPIRAM
+        s_buffer = heap_caps_malloc(STATUS_BUFFER_SIZE, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        if (s_buffer) {
+            ESP_LOGI(TAG, "buffer allocated in PSRAM");
+        } else
+#endif
+        {
+            s_buffer = heap_caps_malloc(STATUS_BUFFER_SIZE, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+        }
+        if (!s_buffer) {
+            ESP_LOGE(TAG, "failed to allocate display buffer");
             return;
         }
     }
@@ -415,8 +446,8 @@ void status_display_init(void) {
 
     uint8_t init_cmds[] = {
         // addressing mode: PAGE addressing (matches per-page flush)
-        0x20, 0x02, 0xB0, 0xC0, 0x00, 0x10, 0x40,
-        0x81, 0x8F, 0xA0, 0xA6, 0xA8, 0x3F, 0xA4, 0xD3,
+        0x20, 0x02, 0xB0, STATUS_COM_SCAN_CMD, 0x00, 0x10, 0x40,
+        0x81, 0x8F, STATUS_SEGMENT_REMAP_CMD, 0xA6, 0xA8, 0x3F, 0xA4, 0xD3,
         0x00, 0xD5, 0x80, 0xD9, 0xF1, 0xDA, 0x12, 0xDB,
         0x40, 0x8D, 0x14, 0xAF
     };
@@ -446,8 +477,6 @@ void status_display_init(void) {
     }
     // create animation worker task
     s_next_anim_allowed_tick = 0;
-    s_ghost_x = 0;
-    s_ghost_dir = 1;
     if (s_anim_task == NULL) {
         xTaskCreate(status_display_anim_task, "status_anim", 2048, NULL, tskIDLE_PRIORITY + 1, &s_anim_task);
     }
@@ -473,7 +502,7 @@ void status_display_set_lines(const char *line_one, const char *line_two) {
     status_display_render(s_line1, s_line2);
     // reset idle timer
     s_last_update_tick = xTaskGetTickCount();
-    s_life_active = false;
+    status_display_animations_reset();
 }
 
 void status_display_show_attack(const char *attack_name, const char *target) {
@@ -522,6 +551,11 @@ void status_display_deinit(void) {
     if (s_i2c_configured) {
         s_i2c_configured = false;
     }
+#if CONFIG_STATUS_DISPLAY_POWER_PIN >= 0
+    // Turn off display by setting power pin HIGH
+    gpio_set_level(CONFIG_STATUS_DISPLAY_POWER_PIN, 1);
+    ESP_LOGI(TAG, "power control pin %d set HIGH (display OFF)", CONFIG_STATUS_DISPLAY_POWER_PIN);
+#endif
 }
 
 #else

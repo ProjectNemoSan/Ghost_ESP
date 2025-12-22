@@ -8,6 +8,8 @@
 #include "managers/views/keyboard_screen.h"
 #include "managers/wifi_manager.h"
 #include "managers/display_manager.h"
+#include "gui/screen_layout.h"
+#include "gui/lvgl_safe.h"
 #include "esp_timer.h"
 #include "esp_heap_caps.h"
 #include "sdkconfig.h"
@@ -38,6 +40,7 @@ static lv_timer_t *terminal_cleanup_retry_timer = NULL;
 static bool terminal_active = false;
 static bool is_stopping = false;
 static bool terminal_initialized = false; // Flag to track if terminal has been fully initialized
+static bool terminal_dualcomm_only = false;
 #define MAX_TEXT_LENGTH 8192
 #define PROCESSING_INTERVAL_MS 10
 #define PROCESSING_INTERVAL_FAST_MS 5
@@ -89,7 +92,6 @@ static void stop_all_operations(void);
 static bool terminal_is_near_bottom(void);
 
 // Additional function predefs
-static void append_to_display_buffer(const char *data, size_t len);
 static void recalc_layout_if_needed(void);
 static void terminal_canvas_draw_event(lv_event_t *e);
 static void terminal_canvas_size_event(lv_event_t *e);
@@ -101,8 +103,6 @@ static char *term_ring = NULL;
 static size_t term_wcount = 0; // total bytes written
 static size_t term_rcount = 0; // consumption baseline for overflow tracking
 static portMUX_TYPE term_ring_mux = portMUX_INITIALIZER_UNLOCKED;
-static char *terminal_viewer_buf = NULL;
-static size_t terminal_display_len = 0;
 static char *terminal_incoming_buf = NULL;
 static size_t dropped_bytes_total = 0;
 static size_t dropped_bytes_notified = 0;
@@ -145,7 +145,7 @@ static void *terminal_alloc_buffer(size_t size) {
 }
 
 static bool ensure_terminal_buffers(void) {
-  if (term_ring && terminal_viewer_buf && terminal_incoming_buf) {
+  if (term_ring && terminal_incoming_buf) {
     return true;
   }
 
@@ -156,15 +156,6 @@ static bool ensure_terminal_buffers(void) {
       return false;
     }
     memset(term_ring, 0, MAX_TEXT_LENGTH);
-  }
-
-  if (!terminal_viewer_buf) {
-    terminal_viewer_buf = terminal_alloc_buffer(MAX_TEXT_LENGTH + 1);
-    if (!terminal_viewer_buf) {
-      ESP_LOGE(TAG, "Failed to allocate terminal viewer buffer");
-      return false;
-    }
-    terminal_viewer_buf[0] = '\0';
   }
 
   if (!terminal_incoming_buf) {
@@ -237,9 +228,7 @@ static void clear_message_queue(void) {
   term_rcount = 0;
   memset(term_ring, 0, MAX_TEXT_LENGTH);
   portEXIT_CRITICAL(&term_ring_mux);
-  terminal_viewer_buf[0] = '\0';
   terminal_incoming_buf[0] = '\0';
-  terminal_display_len = 0;
   dropped_bytes_total = 0;
   dropped_bytes_notified = 0;
   last_displayed_wcount = 0;
@@ -260,37 +249,6 @@ static void clear_message_queue(void) {
 
 static void clear_pre_init_message_queue(void) {
   // no-op with ring buffer
-}
-
-static void append_to_display_buffer(const char *data, size_t len) {
-  if (!data || len == 0) return;
-  if (!ensure_terminal_buffers()) return;
-
-  const size_t max_payload = MAX_TEXT_LENGTH - 1;
-  size_t copy_len = len;
-  if (copy_len > max_payload) {
-    data += copy_len - max_payload;
-    copy_len = max_payload;
-  }
-
-  if (terminal_display_len > max_payload) {
-    terminal_display_len = max_payload;
-  }
-
-  size_t needed = terminal_display_len + copy_len;
-  if (needed > max_payload) {
-    size_t overflow = needed - max_payload;
-    if (overflow >= terminal_display_len) {
-      terminal_display_len = 0;
-    } else {
-      memmove(terminal_viewer_buf, terminal_viewer_buf + overflow, terminal_display_len - overflow);
-      terminal_display_len -= overflow;
-    }
-  }
-
-  memcpy(terminal_viewer_buf + terminal_display_len, data, copy_len);
-  terminal_display_len += copy_len;
-  terminal_viewer_buf[terminal_display_len] = '\0';
 }
 
 static void update_terminal_label(const char *text) { (void)text; (void)terminal_label; }
@@ -393,17 +351,25 @@ static void terminal_push_incoming(const char *data, size_t len) {
   }
 }
 
+static bool terminal_is_dualcomm_line(const char *text);
+static const char *terminal_dualcomm_display_text(const char *text);
+
 static void recalc_layout_if_needed(void) {
   if (!terminal_canvas || !lv_obj_is_valid(terminal_canvas)) return;
-  lv_coord_t w = lv_obj_get_width(terminal_canvas);
-  if (w <= 0) return;
-  if (w != cached_layout_width) {
+  lv_coord_t full_w = lv_obj_get_width(terminal_canvas);
+  if (full_w <= 0) return;
+
+  bool split = terminal_dualcomm_only && (full_w > 0);
+  lv_coord_t col_w = split ? (full_w / 2) : full_w;
+  if (col_w <= 0) col_w = full_w;
+
+  if (col_w != cached_layout_width) {
     // width changed, invalidate cached heights
     for (uint16_t i = 0; i < term_line_count; i++) {
       uint16_t idx = (term_line_head + i) % MAX_TERMINAL_LINES;
       term_lines[idx].pxh = 0;
     }
-    cached_layout_width = w;
+    cached_layout_width = col_w;
   }
 
   const lv_font_t *font = lv_obj_get_style_text_font(terminal_canvas, 0);
@@ -417,7 +383,7 @@ static void recalc_layout_if_needed(void) {
     if (L->pxh == 0) {
       lv_point_t sz;
       const char *txt = (L->text && L->text[0]) ? L->text : " ";
-      lv_txt_get_size(&sz, txt, font, letter_space, line_space, w, LV_TEXT_FLAG_NONE);
+      lv_txt_get_size(&sz, txt, font, letter_space, line_space, col_w, LV_TEXT_FLAG_NONE);
       if (sz.y <= 0) sz.y = lv_font_get_line_height(font);
       L->pxh = (uint16_t)sz.y;
     }
@@ -457,24 +423,73 @@ static void terminal_canvas_draw_event(lv_event_t *e) {
   dsc.flag = LV_TEXT_FLAG_NONE;
 
   lv_coord_t w = lv_obj_get_width(obj);
+  bool split = terminal_dualcomm_only && (w > 60);
+  lv_coord_t col_w = split ? (w / 2) : w;
   lv_coord_t local_top = clip->y1 - obj_coords.y1;
   lv_coord_t local_bottom = clip->y2 - obj_coords.y1;
 
-  lv_coord_t y = 0;
-  for (uint16_t i = 0; i < term_line_count; i++) {
-    uint16_t idx = (term_line_head + i) % MAX_TERMINAL_LINES;
-    TermLine *L = &term_lines[idx];
-    lv_coord_t h = L->pxh;
-    if ((y + h) < local_top) { y += h; continue; }
-    if (y > local_bottom) break;
-    lv_area_t a;
-    a.x1 = obj_coords.x1;
-    a.y1 = obj_coords.y1 + y;
-    a.x2 = a.x1 + w - 1;
-    a.y2 = a.y1 + h - 1;
-    const char *txt = (L->text && L->text[0]) ? L->text : " ";
-    lv_draw_label(draw_ctx, &dsc, &a, txt, NULL);
-    y += h;
+  if (!split) {
+    // Single-column mode: draw all lines sequentially as before
+    lv_coord_t y = 0;
+    for (uint16_t i = 0; i < term_line_count; i++) {
+      uint16_t idx = (term_line_head + i) % MAX_TERMINAL_LINES;
+      TermLine *L = &term_lines[idx];
+      lv_coord_t h = L->pxh;
+      if ((y + h) < local_top) { y += h; continue; }
+      if (y > local_bottom) break;
+      const char *txt = (L->text && L->text[0]) ? L->text : " ";
+      lv_area_t a;
+      a.x1 = obj_coords.x1;
+      a.y1 = obj_coords.y1 + y;
+      a.x2 = a.x1 + col_w - 1;
+      a.y2 = a.y1 + h - 1;
+      lv_draw_label(draw_ctx, &dsc, &a, txt, NULL);
+      y += h;
+    }
+  } else {
+    // Split view: compact each column independently
+    // Left column: non-Dual-Comm logs
+    lv_coord_t y_left = 0;
+    for (uint16_t i = 0; i < term_line_count; i++) {
+      uint16_t idx = (term_line_head + i) % MAX_TERMINAL_LINES;
+      TermLine *L = &term_lines[idx];
+      lv_coord_t h = L->pxh;
+      const char *txt = (L->text && L->text[0]) ? L->text : " ";
+      if (terminal_is_dualcomm_line(txt)) {
+        continue; // skip Dual Comm lines in left column
+      }
+      if ((y_left + h) < local_top) { y_left += h; continue; }
+      if (y_left > local_bottom) break;
+      lv_area_t a;
+      a.x1 = obj_coords.x1;
+      a.y1 = obj_coords.y1 + y_left;
+      a.x2 = a.x1 + col_w - 1;
+      a.y2 = a.y1 + h - 1;
+      lv_draw_label(draw_ctx, &dsc, &a, txt, NULL);
+      y_left += h;
+    }
+
+    // Right column: Dual-Comm-only view
+    lv_coord_t y_right = 0;
+    for (uint16_t i = 0; i < term_line_count; i++) {
+      uint16_t idx = (term_line_head + i) % MAX_TERMINAL_LINES;
+      TermLine *L = &term_lines[idx];
+      lv_coord_t h = L->pxh;
+      const char *txt = (L->text && L->text[0]) ? L->text : " ";
+      if (!terminal_is_dualcomm_line(txt)) {
+        continue; // skip non-Dual lines in right column
+      }
+      if ((y_right + h) < local_top) { y_right += h; continue; }
+      if (y_right > local_bottom) break;
+      const char *s = terminal_dualcomm_display_text(txt);
+      lv_area_t b;
+      b.x1 = obj_coords.x1 + col_w;
+      b.y1 = obj_coords.y1 + y_right;
+      b.x2 = obj_coords.x1 + w - 1;
+      b.y2 = b.y1 + h - 1;
+      lv_draw_label(draw_ctx, &dsc, &b, s, NULL);
+      y_right += h;
+    }
   }
 }
 
@@ -603,8 +618,12 @@ static void scroll_terminal_down(void) {
 static void stop_all_operations(void) {
     terminal_active = false;
     is_stopping = true;
+    
+    if (terminal_dualcomm_only) {
+        simulateCommand("commsend stop");
+    }
+    terminal_dualcomm_only = false;
 
-    // Send all stop commands
     simulateCommand("stop");
 
     vTaskDelay(pdMS_TO_TICKS(20));
@@ -655,16 +674,9 @@ void terminal_view_create(void) {
 
     terminal_active = true;
 
-    terminal_view.root = lv_obj_create(lv_scr_act());
-    lv_obj_set_size(terminal_view.root, LV_HOR_RES, LV_VER_RES);
-    lv_obj_set_style_bg_color(terminal_view.root, lv_color_black(), 0);
-    lv_obj_set_style_bg_opa(terminal_view.root, LV_OPA_COVER, 0);
-    lv_obj_set_style_border_width(terminal_view.root, 0, 0); // Remove border
-    lv_obj_set_style_radius(terminal_view.root, 0, 0);
-    lv_obj_set_scrollbar_mode(terminal_view.root, LV_SCROLLBAR_MODE_OFF);
-    lv_obj_set_style_pad_all(terminal_view.root, 0, 0);
+    terminal_view.root = gui_screen_create_root(NULL, "Terminal", lv_color_black(), LV_OPA_COVER);
 
-    const int STATUS_BAR_HEIGHT = 20;
+    const int STATUS_BAR_HEIGHT = GUI_STATUS_BAR_HEIGHT;
     const int padding = 5;
     const int textbox_height = 40;
 
@@ -809,8 +821,7 @@ void terminal_view_create(void) {
 }
 static void terminal_retry_cleanup_cb(lv_timer_t *timer) {
     if (!retry_cleanup_flag) {
-        lv_timer_del(timer);
-        terminal_cleanup_retry_timer = NULL;
+        lvgl_timer_del_safe(&terminal_cleanup_retry_timer);
         return;
     }
     ESP_LOGI(TAG, "Retrying terminal cleanup...");
@@ -833,19 +844,13 @@ void terminal_view_destroy(void) {
     input_buffer[0] = '\0';
 
     // Delete timer first to prevent callbacks after objects are freed
-    if (terminal_update_timer) {
-        lv_timer_del(terminal_update_timer);
-        terminal_update_timer = NULL;
-    }
+    lvgl_timer_del_safe(&terminal_update_timer);
 
     // Safely delete LVGL objects
     if (terminal_mutex) {
         if (xSemaphoreTake(terminal_mutex, pdMS_TO_TICKS(200)) == pdTRUE) {
             // Delete LVGL objects if they exist
-            if (terminal_view.root) {
-                lv_obj_del(terminal_view.root);
-                terminal_view.root = NULL;
-            }
+            lvgl_obj_del_safe(&terminal_view.root);
             // Set all pointers to NULL to avoid dangling references
             terminal_scroller = NULL;
             terminal_canvas = NULL;
@@ -871,10 +876,32 @@ void terminal_view_destroy(void) {
 
     // Final state reset
     is_stopping = false;
-    if (terminal_cleanup_retry_timer) {
-        lv_timer_del(terminal_cleanup_retry_timer);
-        terminal_cleanup_retry_timer = NULL;
-    }
+    lvgl_timer_del_safe(&terminal_cleanup_retry_timer);
+}
+
+static bool terminal_is_dualcomm_line(const char *text) {
+  if (!text) return false;
+  if (strstr(text, "RX: ") != NULL) return true;
+  if (strstr(text, "I: Discovered peer:") != NULL) return true;
+  if (strstr(text, "Peer has smaller name") != NULL) return true;
+  if (strstr(text, "I: Connecting to peer:") != NULL) return true;
+  if (strstr(text, "I: Sent command:") != NULL) return true;
+  if (strstr(text, "Handshake completed!") != NULL) return true;
+  if (strstr(text, "W: Handshake timeout") != NULL) return true;
+  if (strstr(text, "W: Connection lost, restarting discovery") != NULL) return true;
+  if (strstr(text, "ESP Comm Response: ") != NULL) return true;
+  return false;
+}
+
+static const char *terminal_dualcomm_display_text(const char *text) {
+  if (!text) return "";
+  // trim leading spaces
+  while (*text == ' ' || *text == '\t') text++;
+  if (strncmp(text, "RX: ", 4) == 0) return text + 4;
+  if (strncmp(text, "I: ", 3) == 0) return text + 3;
+  if (strncmp(text, "W: ", 3) == 0) return text + 3;
+  if (strncmp(text, "ESP Comm Response: ", 20) == 0) return text + 20;
+  return text;
 }
 
 void terminal_view_add_text(const char *text) {
@@ -949,9 +976,10 @@ void terminal_view_hardwareinput_callback(InputEvent *event) {
   } else if (event->type == INPUT_TYPE_JOYSTICK) {
     int button = event->data.joystick_index;
     
-    if (button == 1) {
-      // Open keyboard for text input
-      if (input_label) {
+    if (button == 1 || button == 3) {
+      if (input_len > 0) {
+        submit_text();
+      } else if (input_label) {
         keyboard_view_set_return_view(&terminal_view);
         keyboard_view_set_submit_callback(keyboard_input_callback);
         keyboard_view_set_placeholder("Enter command...");
@@ -961,10 +989,8 @@ void terminal_view_hardwareinput_callback(InputEvent *event) {
       scroll_terminal_up();
     } else if (button == 4) {
       scroll_terminal_down();
-    } else if (button == 0) { // left - exit terminal
+    } else if (button == 0) {
       stop_all_operations();
-    } else if (button == 3) { // right - submit text
-      submit_text();
     }
   } else if (event->type == INPUT_TYPE_KEYBOARD) {
     uint8_t key = event->data.key_value;
@@ -974,8 +1000,15 @@ void terminal_view_hardwareinput_callback(InputEvent *event) {
       scroll_terminal_up();
     } else if (key == 46 || key == '.') {      //down arrow
       scroll_terminal_down();
-    } else if (key == 13){
-      submit_text();
+    } else if (key == 13) {
+      if (input_len > 0) {
+        submit_text();
+      } else if (input_label) {
+        keyboard_view_set_return_view(&terminal_view);
+        keyboard_view_set_submit_callback(keyboard_input_callback);
+        keyboard_view_set_placeholder("Enter command...");
+        display_manager_switch_view(&keyboard_view);
+      }
     } else if (key == 8 || key == 127) { // backspace
       remove_char_from_buffer();
     } else if (key == 32) { // space
@@ -998,8 +1031,20 @@ void terminal_view_hardwareinput_callback(InputEvent *event) {
         ESP_LOGD(TAG, "Encoder button press debounced");
         return;
       }
-      stop_all_operations();
-      createdTimeInMs = now_ms; // Update last press time
+      createdTimeInMs = now_ms;
+      if (input_len > 0) {
+        submit_text();
+#if defined(CONFIG_USE_JOYSTICK) || defined(CONFIG_USE_TOUCHSCREEN)
+      } else if (input_label) {
+        keyboard_view_set_return_view(&terminal_view);
+        keyboard_view_set_submit_callback(keyboard_input_callback);
+        keyboard_view_set_placeholder("Enter command...");
+        display_manager_switch_view(&keyboard_view);
+#else
+      } else {
+        stop_all_operations();
+#endif
+      }
     } else {
       if (event->data.encoder.direction > 0) {
         scroll_terminal_down();
@@ -1036,4 +1081,8 @@ View terminal_view = {
 
 void terminal_set_return_view(View *view) {
     terminal_return_view = view;
+}
+
+void terminal_set_dualcomm_filter(bool enable) {
+    terminal_dualcomm_only = enable;
 }

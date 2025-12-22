@@ -9,6 +9,7 @@
 #include "lvgl_helpers.h"
 #include "managers/sd_card_manager.h"
 #include "managers/settings_manager.h"
+#include "gui/theme_palette_api.h"
 #include "managers/views/error_popup.h"
 #include "managers/views/main_menu_screen.h"
 #include "managers/views/options_screen.h"
@@ -25,7 +26,12 @@
 #include "managers/ap_manager.h"
 #include "core/serial_manager.h"
 #include "managers/wifi_manager.h"
+#include "managers/rgb_manager.h"
 #include "driver/i2c.h"
+#include "soc/soc_caps.h"
+#include "io_manager/i2c_bus_lock.h"
+#include "core/screen_mirror.h"
+#include "gui/lvgl_safe.h"
 
 #ifdef CONFIG_USE_CARDPUTER
 #include "vendor/keyboard_handler.h"
@@ -54,8 +60,8 @@
 #include "managers/fuel_gauge_manager.h"
 #endif
 
-// Global low-I2C activity mode. When true, subsystems should avoid I2C-heavy polling/logging
-// to reduce contention (e.g., while PN532 scanning/bruteforcing).
+QueueHandle_tt input_queue = NULL;
+
 static volatile bool g_low_i2c_mode = false;
 
 #ifdef CONFIG_HAS_FUEL_GAUGE
@@ -124,6 +130,8 @@ static void battery_poll_task(void *arg) {
 #define LILYGO_KB_SLAVE_ADDRESS              0x55
 #define LILYGO_KB_BRIGHTNESS_CMD             0x01
 #define LILYGO_KB_ALT_B_BRIGHTNESS_CMD       0x02
+#define TDECK_KEY_DEBOUNCE_MS                30
+#define TDECK_EVENT_RATE_LIMIT_MS            10
 
 void set_keyboard_brightness(uint8_t brightness);
 
@@ -174,12 +182,18 @@ static joystick_t exit_button; // IO6 exit button
 
 #define FADE_DURATION_MS 10
 #define DEFAULT_DISPLAY_TIMEOUT_MS 30000
+#define JOYSTICK_REPEAT_INITIAL_DELAY_MS 350
+#define JOYSTICK_REPEAT_INTERVAL_MS 120
 
 uint32_t display_timeout_ms = DEFAULT_DISPLAY_TIMEOUT_MS;
 
 static uint16_t original_beacon_interval = 100;
 
 #define BACKLIGHT_SLEEP_POLL_MS 50   // Poll slower when dimmed
+
+static inline uint32_t dm_now_ms(void) {
+  return (uint32_t)(esp_timer_get_time() / 1000ULL);
+}
 
 #ifdef CONFIG_IS_S3TWATCH
 #define WAKE_UP_PIN GPIO_NUM_16
@@ -225,6 +239,9 @@ static void invert_flush_cb(lv_disp_drv_t *drv, const lv_area_t *area,
             color_p[i].full = ~color_p[i].full;
         }
     }
+    
+    screen_mirror_send_area(area, color_p);
+    
 #ifdef CONFIG_USE_CARDPUTER
     m5stack_lvgl_render_callback(drv, area, color_p);
 #elif defined(CONFIG_USE_TDISPLAY_S3)
@@ -609,14 +626,22 @@ void fade_out_ready_cb(lv_anim_t *anim) {
 
     new_view->create();
 
-    // Avoid running the per-tick fade animation for the keyboard view because
-    // the opacity animation forces heavy draw work (masks/labels) and can
-    // starve the LVGL tick/watchdog during the keyboard fade-in.
+    // Avoid running the per-tick fade animation for specific heavy views
+    // because the opacity animation forces heavy draw work (masks/labels)
+    // and can starve the LVGL tick/watchdog during the fade-in.
     if (new_view->name && strcmp(new_view->name, "Keyboard Screen") == 0) {
       if (new_view->root) {
         // make fully opaque immediately
         lv_obj_set_style_opa(new_view->root, LV_OPA_COVER, 0);
         // temporarily remove rounded radii to avoid expensive mask draws
+        set_radius_recursive(new_view->root, 0);
+      }
+      if (status_bar) lv_obj_set_style_opa(status_bar, LV_OPA_COVER, 0);
+    } else if (new_view->name && strcmp(new_view->name, "Options Screen") == 0 && SelectedMenuType == OT_DualComm) {
+      if (new_view->root) {
+        // For the large Dual Comm options list, skip fade-in to keep
+        // LVGL's tick task lightweight.
+        lv_obj_set_style_opa(new_view->root, LV_OPA_COVER, 0);
         set_radius_recursive(new_view->root, 0);
       }
       if (status_bar) lv_obj_set_style_opa(status_bar, LV_OPA_COVER, 0);
@@ -798,24 +823,20 @@ static void status_update_cb(lv_timer_t *timer) {
                     battery_percentage, settings_get_power_save_enabled(&G_Settings), server_running);
 }
 
-static const uint32_t theme_palettes[15][6] = {
-// bluetooth colors,wifi colors,GPS colors,Apps colors,Clock Colors,Settings colors
-        {0x1976D2,0xD32F2F,0x388E3C,0x7B1FA2,0x000000,0xFF9800}, // default
-        {0xFFCDD2,0xC8E6C9,0xB3E5FC,0xFFF9C4,0xD1C4E9,0xCFD8DC}, // Pastel
-        {0x263238,0x37474F,0x455A64,0x546E7A,0x263238,0x37474F}, // Dark
-        {0xFFFFFF,0xFFFFFF,0xFFFFFF,0xFFFFFF,0xFFFFFF,0xFFFFFF}, // Bright
-        {0x002B36,0x073642,0x586E75,0x839496,0xEEE8D5,0x002B36}, // Solarized
-        {0x888888,0x888888,0x888888,0x888888,0x888888,0x888888}, // Monochrome
-        {0xE91E63,0xE91E63,0xE91E63,0xE91E63,0xE91E63,0xE91E63}, // Rose Red
-        {0x9C27B0,0x9C27B0,0x9C27B0,0x9C27B0,0x9C27B0,0x9C27B0}, // Purple
-        {0x2196F3,0x2196F3,0x2196F3,0x2196F3,0x2196F3,0x2196F3}, // Blue
-        {0xFFA500,0xFFA500,0xFFA500,0xFFA500,0xFFA500,0xFFA500}, // Orange
-        {0x39FF14,0xFF073A,0x0FF1CE,0xF8F32B,0xFF6EC7,0xFF8C00}, // Neon
-        {0xFF00FF,0x00FFFF,0xFF0000,0x00FF00,0xFFFF00,0x800080}, // Cyberpunk
-        {0x0077BE,0x00CED1,0x20B2AA,0x4682B4,0x5F9EA0,0x00008B}, // Ocean
-        {0xFF4500,0xFF8C00,0xFFD700,0xFF1493,0x8B008B,0x2E0854}, // Sunset
-        {0x556B2F,0x6B8E23,0x228B22,0x2E8B57,0x8FBC8F,0x8B4513}  // Forest
-    };
+void display_manager_update_status_bar_color(void) {
+  if (!status_bar || !lv_obj_is_valid(status_bar)) {
+    return;
+  }
+
+  uint8_t theme = settings_get_menu_theme(&G_Settings);
+  lv_obj_set_style_border_color(status_bar, lv_color_hex(theme_palette_get_accent(theme)), LV_PART_MAIN);
+
+  if (mainlabel && lv_obj_is_valid(mainlabel)) {
+    lv_obj_set_style_text_color(mainlabel, lv_color_hex(0x999999), 0);
+  }
+
+  status_update_cb(NULL);
+}
 
 void display_manager_add_status_bar(const char *CurrentMenuName) {
     const char *label_text = CurrentMenuName ? CurrentMenuName : "";
@@ -833,7 +854,7 @@ void display_manager_add_status_bar(const char *CurrentMenuName) {
         bt_label = NULL;
         sd_label = NULL;
         battery_label = NULL;
-        lv_obj_del(old_bar);
+        lvgl_obj_del_safe(&old_bar);
     }
     status_bar = lv_obj_create(lv_scr_act());
   lv_obj_set_size(status_bar, LV_HOR_RES, 20);
@@ -844,7 +865,7 @@ void display_manager_add_status_bar(const char *CurrentMenuName) {
   lv_obj_set_style_border_width(status_bar, 1, LV_PART_MAIN);
   {
     uint8_t theme = settings_get_menu_theme(&G_Settings);
-    lv_obj_set_style_border_color(status_bar, lv_color_hex(theme_palettes[theme][0]), LV_PART_MAIN);
+    lv_obj_set_style_border_color(status_bar, lv_color_hex(theme_palette_get_accent(theme)), LV_PART_MAIN);
   }
   lv_obj_clear_flag(status_bar, LV_OBJ_FLAG_SCROLLABLE);
   lv_obj_set_style_radius(status_bar, 0, LV_PART_MAIN);
@@ -922,15 +943,17 @@ void display_manager_add_status_bar(const char *CurrentMenuName) {
 }
 
 void apply_power_management_config(bool power_save_enabled) {
-  esp_pm_config_esp32_t pm_cfg = {
+  esp_pm_config_t pm_cfg = {
       .max_freq_mhz = power_save_enabled ? 80 : CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ,
-      .min_freq_mhz = 20,
-      .light_sleep_enable = true,
+      .min_freq_mhz = power_save_enabled ? 20 : CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ,
+      .light_sleep_enable = power_save_enabled,
   };
+  rgb_manager_power_transition_begin();
   esp_err_t pm_err = esp_pm_configure(&pm_cfg);
   if (pm_err != ESP_OK) {
     ESP_LOGW(TAG, "pm configure failed: %s", esp_err_to_name(pm_err));
   }
+  rgb_manager_power_transition_end();
 
 #if defined(CONFIG_LV_DISP_BACKLIGHT_PWM)
   // Reconfigure LEDC timer after power management changes to maintain stable PWM
@@ -955,7 +978,13 @@ void apply_power_management_config(bool power_save_enabled) {
 
 void display_manager_init(void) {
 
-  esp_pm_config_esp32_t pm_cfg = {
+  static bool lvgl_lock_registered = false;
+  if (!lvgl_lock_registered) {
+    lvgl_i2c_locking(i2c_bus_get_lock_handle());
+    lvgl_lock_registered = true;
+  }
+
+  esp_pm_config_t pm_cfg = {
     .max_freq_mhz = CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ,
     .min_freq_mhz = 80,
     .light_sleep_enable = true,
@@ -992,7 +1021,15 @@ void display_manager_init(void) {
       .hpoint = 0,
       .sleep_mode = LEDC_SLEEP_MODE_KEEP_ALIVE,
   };
+  #ifdef CONFIG_USE_TDISPLAY_S3
   ledc_channel_config(&ledc_channel);
+  #else
+  if (CONFIG_LV_DISP_PIN_BCKL >= 0) {
+    ledc_channel_config(&ledc_channel);
+  } else {
+    ESP_LOGI(TAG, "Backlight GPIO not configured; skipping LEDC channel init");
+  }
+  #endif
 
 #ifdef CONFIG_USE_TDECK
 set_keyboard_brightness(0xFF); // Set to 100% brightness
@@ -1117,7 +1154,7 @@ set_keyboard_brightness(0xFF); // Set to 100% brightness
     return;
   }
 
-  input_queue = xQueueCreate(10, sizeof(InputEvent));
+  input_queue = xQueueCreate(32, sizeof(InputEvent));
   if (input_queue == NULL) {
     ESP_LOGE(TAG, "Failed to create input queue\n");
     return;
@@ -1130,16 +1167,14 @@ set_keyboard_brightness(0xFF); // Set to 100% brightness
 
 #ifdef CONFIG_HAS_BATTERY
   axp2101_init();
-#ifdef CONFIG_HAS_RTC_CLOCK
   pcf8563_init(I2C_NUM_1, 0x51);
-#endif
 #endif
 
 #ifdef CONFIG_HAS_FUEL_GAUGE
   if (fuel_gauge_manager_init()) {
     ESP_LOGI(TAG, "Fuel gauge manager initialized successfully");
     if (battery_poll_task_handle == NULL) {
-      xTaskCreate(battery_poll_task, "battery_poll", 4096, NULL, 5, &battery_poll_task_handle);
+      xTaskCreate(battery_poll_task, "battery_poll", 2048, NULL, 5, &battery_poll_task_handle);
     }
   } else {
     ESP_LOGW(TAG, "Failed to initialize fuel gauge manager");
@@ -1147,6 +1182,17 @@ set_keyboard_brightness(0xFF); // Set to 100% brightness
 #endif
 
 #ifdef CONFIG_USE_ENCODER
+#ifdef CONFIG_USE_IO_EXPANDER
+    // Encoder on IO expander - use virtual pin numbers (P05=5, P06=6, P07=7)
+    // These are IO expander pins, not ESP32 GPIOs
+    encoder_init(&g_encoder,
+                 5,  // P05 = encoder A on IO expander
+                 6,  // P06 = encoder B on IO expander  
+                 false,  // pullups handled by TCA9535
+                 ENCODER_LATCH_FOUR3);
+    joystick_init(&enc_button, 7, 500 /*hold ms*/, false); // P07 = encoder button
+#else
+    // Direct GPIO encoder (TEmbed C1101)
     encoder_init(&g_encoder,
                  CONFIG_ENCODER_INA,
                  CONFIG_ENCODER_INB,
@@ -1155,8 +1201,13 @@ set_keyboard_brightness(0xFF); // Set to 100% brightness
     joystick_init(&enc_button, CONFIG_ENCODER_KEY,
                   500 /*hold ms*/, true);
 
-    // initialize IO6 exit button
-    joystick_init(&exit_button, 6, 500 /*hold ms*/, true);
+#ifdef CONFIG_BUILD_CONFIG_TEMPLATE
+    // GPIO 6 exit button is TEmbed C1101 only
+    if (strcmp(CONFIG_BUILD_CONFIG_TEMPLATE, "LilyGo TEmbedC1101") == 0) {
+        joystick_init(&exit_button, 6, 500 /*hold ms*/, true);
+    }
+#endif
+#endif
 #endif
 // initialize wake button interrupt
 #ifdef CONFIG_IS_S3TWATCH
@@ -1238,13 +1289,34 @@ static void dm_switch_async_cb(void *param) {
   display_manager_switch_view_internal((View *)param);
 }
 
-void display_manager_switch_view(View *view) {
-  if (view == NULL) return;
+typedef struct {
+  void (*fn)(void *);
+  void *arg;
+} dm_lvgl_call_t;
+
+static void dm_run_on_lvgl_async_cb(void *param) {
+  dm_lvgl_call_t *call = (dm_lvgl_call_t *)param;
+  if (!call) return;
+  if (call->fn) call->fn(call->arg);
+  free(call);
+}
+
+void display_manager_run_on_lvgl(void (*fn)(void *), void *arg) {
+  if (!fn) return;
   if (lvgl_task_handle && xTaskGetCurrentTaskHandle() != lvgl_task_handle) {
-    lv_async_call(dm_switch_async_cb, view);
+    dm_lvgl_call_t *call = malloc(sizeof(*call));
+    if (!call) return;
+    call->fn = fn;
+    call->arg = arg;
+    lv_async_call(dm_run_on_lvgl_async_cb, call);
     return;
   }
-  display_manager_switch_view_internal(view);
+  fn(arg);
+}
+
+void display_manager_switch_view(View *view) {
+  if (view == NULL) return;
+  display_manager_run_on_lvgl(dm_switch_async_cb, view);
 }
 
 void display_manager_destroy_current_view(void) {
@@ -1298,16 +1370,24 @@ void set_backlight_brightness(uint8_t percentage) {
     ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0);
     ESP_LOGI(TAG, "TDisplay S3 backlight: %d%% (LEDC PWM)", percentage);
 #elif defined(CONFIG_LV_DISP_BACKLIGHT_PWM)
-    uint32_t duty = (percentage * ((1 << LEDC_TIMER_10_BIT) - 1)) / 100;
-    ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0, duty);
-    ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0);
+    if (CONFIG_LV_DISP_PIN_BCKL >= 0) {
+        uint32_t duty = (percentage * ((1 << LEDC_TIMER_10_BIT) - 1)) / 100;
+        ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0, duty);
+        ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0);
+    } else {
+        ESP_LOGD(TAG, "Backlight GPIO not configured; skipping PWM backlight");
+    }
 #elif defined(CONFIG_LV_DISP_BACKLIGHT_SWITCH)
     // ----- switch mode -----
     // make sure the pin is configured as a GPIO output
 
-    gpio_reset_pin(CONFIG_LV_DISP_PIN_BCKL);
-    gpio_set_direction(CONFIG_LV_DISP_PIN_BCKL, GPIO_MODE_OUTPUT);
-    gpio_set_level(CONFIG_LV_DISP_PIN_BCKL, percentage > 0 ? 1 : 0);
+    if (CONFIG_LV_DISP_PIN_BCKL >= 0) {
+        gpio_reset_pin(CONFIG_LV_DISP_PIN_BCKL);
+        gpio_set_direction(CONFIG_LV_DISP_PIN_BCKL, GPIO_MODE_OUTPUT);
+        gpio_set_level(CONFIG_LV_DISP_PIN_BCKL, percentage > 0 ? 1 : 0);
+    } else {
+        ESP_LOGD(TAG, "Backlight GPIO not configured; skipping switch backlight");
+    }
 #else
 # error "Either CONFIG_LV_DISP_BACKLIGHT_PWM or CONFIG_LV_DISP_BACKLIGHT_SWITCH must be set"
 #endif
@@ -1316,6 +1396,7 @@ void set_backlight_brightness(uint8_t percentage) {
 
 #ifdef CONFIG_USE_TDECK
     // Synchronize keyboard backlight with screen backlight
+    // ...
     set_keyboard_brightness(percentage == max_brightness ? 0xFF : 0x00);
 #endif
 
@@ -1406,6 +1487,13 @@ void hardware_input_task(void *pvParameters) {
   int screen_width = LV_HOR_RES;
   int screen_height = LV_VER_RES;
   bool was_woken_by_interrupt = false; // New flag for S3T-Watch
+#ifdef CONFIG_USE_TDECK
+  static uint8_t last_tdeck_key = 0;
+  static uint32_t last_tdeck_key_ms = 0;
+  static uint32_t last_tdeck_event_ms = 0;
+
+  gpio_set_direction(46, GPIO_MODE_INPUT);
+#endif
 #ifdef CONFIG_USE_CARDPUTER
   uint8_t shift_count_before_caps =255; // effectively disable hold-to-caps for normal cardputer
   uint8_t shift_count = 0;
@@ -1417,26 +1505,39 @@ void hardware_input_task(void *pvParameters) {
   while (1) {
 #ifdef CONFIG_USE_TDECK
     uint8_t data[1];
-    gpio_set_direction(46, GPIO_MODE_INPUT); // probably should be a part of the init process
     if (gpio_get_level(46)){
-    lvgl_i2c_read(CONFIG_LV_I2C_TOUCH_PORT, LILYGO_KB_SLAVE_ADDRESS, 0x00, &data, 1);
+    if (lvgl_i2c_read(CONFIG_LV_I2C_TOUCH_PORT, LILYGO_KB_SLAVE_ADDRESS, 0x00, &data, 1) != ESP_OK) {
+      data[0] = 0;
+    }
     } else {
       data[0] = 0; // if the pin is low we assume no data is available
     }
-    if (memcmp(data, "", 1) != 0){
+    if (data[0] != 0){
 
-      ESP_LOGI(TAG, "tdeck keyboard data is %s\n", data);
+      ESP_LOGD(TAG, "tdeck keyboard data: 0x%02x", data[0]);
 
-      bool skip_event = false;
       touch_active = true;
-      last_touch_time = xTaskGetTickCount();
       if (is_backlight_dimmed) {
         set_backlight_brightness(100);
         is_backlight_dimmed = false;
-        skip_event = true;
         vTaskDelay(pdMS_TO_TICKS(100));
       }
-      if (!skip_event) {
+
+      uint32_t now_ms = dm_now_ms();
+      bool should_emit = true;
+      if ((uint32_t)(now_ms - last_tdeck_event_ms) < (uint32_t)TDECK_EVENT_RATE_LIMIT_MS) {
+        should_emit = false;
+      } else if (data[0] == last_tdeck_key && (uint32_t)(now_ms - last_tdeck_key_ms) < (uint32_t)TDECK_KEY_DEBOUNCE_MS) {
+        should_emit = false;
+      }
+
+      if (should_emit) {
+        last_tdeck_event_ms = now_ms;
+        last_tdeck_key = data[0];
+        last_tdeck_key_ms = now_ms;
+
+        last_touch_time = xTaskGetTickCount();
+
         InputEvent event;
         event.type = INPUT_TYPE_KEYBOARD;
         event.data.key_value = *data;
@@ -1462,27 +1563,40 @@ void hardware_input_task(void *pvParameters) {
     encoder_tick(&g_encoder);
 
     /* direction events */
-    int8_t dir = encoder_get_direction(&g_encoder);
-    if (dir) {
-        // treat an encoder turn as “touch”
+    if (encoder_peek_direction(&g_encoder) != ENCODER_DIR_NONE) {
+        // treat an encoder turn as "touch"
         last_touch_time = xTaskGetTickCount();
         if (is_backlight_dimmed) {
           set_backlight_brightness(100);
           is_backlight_dimmed = false;
           // Don't send input event when waking from dimmed state
         } else {
-          // Only send input event if display was already active
-          InputEvent ev = {
-              .type = INPUT_TYPE_ENCODER,
-              .data.encoder = { .direction = dir, .button = false }
-          };
-          xQueueSend(input_queue, &ev, 0);
+          const int max_encoder_events_per_tick = 4;
+          for (int i = 0; i < max_encoder_events_per_tick; i++) {
+              encoder_direction_t raw_dir = encoder_peek_direction(&g_encoder);
+              if (raw_dir == ENCODER_DIR_NONE) break;
+
+              int8_t dir = (int8_t)raw_dir;
+              if (settings_get_encoder_invert_direction(&G_Settings)) {
+                  dir = (int8_t)-dir;
+              }
+
+              InputEvent ev = {
+                  .type = INPUT_TYPE_ENCODER,
+                  .data.encoder = { .direction = dir, .button = false }
+              };
+              if (xQueueSend(input_queue, &ev, 0) == pdTRUE) {
+                  encoder_consume_direction(&g_encoder, raw_dir);
+              } else {
+                  break;
+              }
+          }
         }
     }
 
-    /* push-switch -> treat like “button” */
+    /* push-switch -> treat like "button" */
     if (joystick_just_pressed(&enc_button)) {
-        // treat an encoder click as “touch”
+        // treat an encoder click as "touch"
         last_touch_time = xTaskGetTickCount();
         if (is_backlight_dimmed) {
           set_backlight_brightness(100);
@@ -1499,30 +1613,31 @@ void hardware_input_task(void *pvParameters) {
     }
 #endif
 
-#ifdef CONFIG_USE_ENCODER
-    // check IO6 exit button
-    if (joystick_just_pressed(&exit_button)) {
-        last_touch_time = xTaskGetTickCount();
-        if (is_backlight_dimmed) {
-          set_backlight_brightness(100);
-          is_backlight_dimmed = false;
-        } else {
-          InputEvent ev = {
-              .type = INPUT_TYPE_EXIT_BUTTON,
-              .data.exit_pressed = true
-          };
-          xQueueSend(input_queue, &ev, 0);
+#if defined(CONFIG_USE_ENCODER) && defined(CONFIG_BUILD_CONFIG_TEMPLATE)
+    if (strcmp(CONFIG_BUILD_CONFIG_TEMPLATE, "LilyGo TEmbedC1101") == 0) {
+        // check IO6 exit button (TEmbed C1101 only)
+        if (joystick_just_pressed(&exit_button)) {
+            last_touch_time = xTaskGetTickCount();
+            if (is_backlight_dimmed) {
+              set_backlight_brightness(100);
+              is_backlight_dimmed = false;
+            } else {
+              InputEvent ev = {
+                  .type = INPUT_TYPE_EXIT_BUTTON,
+                  .data.exit_pressed = true
+              };
+              xQueueSend(input_queue, &ev, 0);
+            }
         }
-    }
 
-    // Check for 7-second hold to enter deep sleep
-    if (joystick_get_button_state(&exit_button) && exit_button.pressed) {
+        // Check for 7-second hold to enter deep sleep
+        if (joystick_get_button_state(&exit_button) && exit_button.pressed) {
         uint32_t elapsed = (esp_timer_get_time() / 1000) - exit_button.hold_init;
         if (elapsed >= 7000 && !exit_button.deep_sleep_triggered) { // 7 seconds
             ESP_LOGI("DeepSleep", "IO6 held for 7 seconds, preparing for deep sleep");
             exit_button.deep_sleep_triggered = true;
 
-            // Pull IO15 low before sleep
+            // Pull IO15 low before sleep (TEmbed C1101 power control)
             gpio_set_level(15, 0);
             ESP_LOGI("DeepSleep", "IO15 pulled low");
 
@@ -1551,15 +1666,20 @@ void hardware_input_task(void *pvParameters) {
             io_conf.pull_up_en = GPIO_PULLUP_ENABLE;
             gpio_config(&io_conf);
 
-            // Configure IO6 as wake source for a new press using EXT0
-            esp_err_t ret = esp_sleep_enable_ext0_wakeup(GPIO_NUM_6, 0); // Wake on low level (button press)
+#if SOC_PM_SUPPORT_EXT0_WAKEUP
+            esp_err_t ret = esp_sleep_enable_ext0_wakeup(GPIO_NUM_6, 0);
+#elif SOC_PM_SUPPORT_EXT1_WAKEUP
+            esp_err_t ret = esp_sleep_enable_ext1_wakeup_io(1ULL << GPIO_NUM_6, ESP_EXT1_WAKEUP_ALL_LOW);
+#else
+            esp_err_t ret = ESP_ERR_NOT_SUPPORTED;
+#endif
             if (ret != ESP_OK) {
                 ESP_LOGE("DeepSleep", "Failed to configure wake-up source: %s", esp_err_to_name(ret));
                 exit_button.deep_sleep_triggered = false;
                 gpio_set_level(15, 1); // Restore IO15 high
                 return;
             }
-            ESP_LOGI("DeepSleep", "Wake-up source configured for new button press using EXT0");
+            ESP_LOGI("DeepSleep", "Wake-up source configured for new button press");
 
             ESP_LOGI("DeepSleep", "Entering deep sleep now...");
             vTaskDelay(pdMS_TO_TICKS(200)); // Give time for log to print
@@ -1571,9 +1691,10 @@ void hardware_input_task(void *pvParameters) {
             // Enter deep sleep
             esp_deep_sleep_start();
         }
-    } else {
-        // Reset deep sleep trigger when button is released
-        exit_button.deep_sleep_triggered = false;
+        } else {
+            // Reset deep sleep trigger when button is released
+            exit_button.deep_sleep_triggered = false;
+        }
     }
 #endif
 
@@ -1667,22 +1788,49 @@ void hardware_input_task(void *pvParameters) {
       }
 #endif
 
-#ifdef CONFIG_USE_JOYSTICK
+ #ifdef CONFIG_USE_JOYSTICK
+    static uint32_t joystick_repeat_next_ms[5] = {0};
     for (int i = 0; i < 5; i++) {
-      if (joysticks[i].pin >= 0) {
-        if (joystick_just_pressed(&joysticks[i])) {
-          last_touch_time = xTaskGetTickCount();
-          InputEvent event;
-          event.type = INPUT_TYPE_JOYSTICK;
-          event.data.joystick_index = i;
+      if (joysticks[i].pin < 0) continue;
 
-          if (xQueueSend(input_queue, &event, pdMS_TO_TICKS(10)) != pdTRUE) {
-            ESP_LOGE(TAG, "Failed to send joystick input to queue\n");
-          }
+      if (joystick_just_pressed(&joysticks[i])) {
+        last_touch_time = xTaskGetTickCount();
+        InputEvent event;
+        event.type = INPUT_TYPE_JOYSTICK;
+        event.data.joystick_index = i;
+
+        if (xQueueSend(input_queue, &event, pdMS_TO_TICKS(10)) != pdTRUE) {
+          ESP_LOGE(TAG, "Failed to send joystick input to queue\n");
+        }
+
+        if (i == 2 || i == 4) {
+          joystick_repeat_next_ms[i] = dm_now_ms() + JOYSTICK_REPEAT_INITIAL_DELAY_MS;
+        }
+        continue;
+      }
+
+      if (i != 2 && i != 4) continue;
+
+      if (!joystick_get_button_state(&joysticks[i])) {
+        joystick_repeat_next_ms[i] = 0;
+        continue;
+      }
+
+      if (joystick_repeat_next_ms[i] == 0) continue;
+
+      uint32_t now_ms = dm_now_ms();
+      if ((int32_t)(now_ms - joystick_repeat_next_ms[i]) >= 0) {
+        last_touch_time = xTaskGetTickCount();
+        InputEvent event;
+        event.type = INPUT_TYPE_JOYSTICK;
+        event.data.joystick_index = i;
+
+        if (xQueueSend(input_queue, &event, 0) == pdTRUE) {
+          joystick_repeat_next_ms[i] = now_ms + JOYSTICK_REPEAT_INTERVAL_MS;
         }
       }
     }
-#endif
+ #endif
 
 #ifdef CONFIG_USE_TOUCHSCREEN
 
@@ -1785,11 +1933,17 @@ void processEvent() {
     return;
   }
 
-  const int max_events = 8;
+  const int max_events = 16;
   int processed = 0;
   InputEvent event;
 
   while (processed < max_events && xQueueReceive(input_queue, &event, 0) == pdTRUE) {
+    last_touch_time = xTaskGetTickCount();
+    if (is_backlight_dimmed || is_backlight_off) {
+      set_backlight_brightness(100);
+      is_backlight_dimmed = false;
+      is_backlight_off = false;
+    }
     if (xSemaphoreTake(dm.mutex, pdMS_TO_TICKS(MUTEX_TIMEOUT_MS)) == pdTRUE) {
       View *current = dm.current_view;
       void (*input_callback)(InputEvent *) = NULL;
@@ -1812,6 +1966,12 @@ void processEvent() {
 
   if (processed == 0) {
     if (xQueueReceive(input_queue, &event, pdMS_TO_TICKS(1)) == pdTRUE) {
+      last_touch_time = xTaskGetTickCount();
+      if (is_backlight_dimmed || is_backlight_off) {
+        set_backlight_brightness(100);
+        is_backlight_dimmed = false;
+        is_backlight_off = false;
+      }
       if (xSemaphoreTake(dm.mutex, pdMS_TO_TICKS(MUTEX_TIMEOUT_MS)) == pdTRUE) {
         View *current = dm.current_view;
         void (*input_callback)(InputEvent *) = NULL;
@@ -1863,30 +2023,3 @@ void set_keyboard_brightness(uint8_t brightness) {
     lvgl_i2c_write(CONFIG_LV_I2C_TOUCH_PORT, LILYGO_KB_SLAVE_ADDRESS, 0x00, kb_brightness, 2);
 }
 #endif
-
-void display_manager_update_status_bar_color(void) {
-    if (!status_bar || !lv_obj_is_valid(status_bar)) return;
-    uint8_t theme = settings_get_menu_theme(&G_Settings);
-    lv_color_t color = lv_color_hex(theme_palettes[theme][0]);
-    lv_obj_set_style_border_color(status_bar, color, 0);
-
-    // Reset label colors as well
-    lv_color_t default_color = lv_color_hex(0xCCCCCC);
-    if (wifi_label && lv_obj_is_valid(wifi_label)) {
-        lv_obj_set_style_text_color(wifi_label, default_color, 0);
-    }
-    if (bt_label && lv_obj_is_valid(bt_label)) {
-        lv_obj_set_style_text_color(bt_label, default_color, 0);
-    }
-    if (sd_label && lv_obj_is_valid(sd_label)) {
-        lv_obj_set_style_text_color(sd_label, default_color, 0);
-    }
-    if (battery_label && lv_obj_is_valid(battery_label)) {
-        lv_obj_set_style_text_color(battery_label, default_color, 0);
-    }
-    if (mainlabel && lv_obj_is_valid(mainlabel)) {
-        lv_obj_set_style_text_color(mainlabel, lv_color_hex(0x999999), 0);
-    }
-    lv_obj_invalidate(status_bar);
-}
-

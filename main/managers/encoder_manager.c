@@ -1,6 +1,11 @@
 #include "managers/encoder_manager.h"
 #include "driver/gpio.h"
 #include "esp_timer.h"
+#include "esp_log.h"
+
+#ifdef CONFIG_USE_IO_EXPANDER
+#include "io_manager.h"
+#endif
 
 /* --- lookup table from Matthias Hertel’s library --- */
 static const int8_t KNOBDIR[16] = {
@@ -20,7 +25,6 @@ static inline uint32_t now_ms(void)
 {
     return (uint32_t)(esp_timer_get_time() / 1000ULL);
 }
-\
 
 void encoder_init(encoder_t *enc,
                   int pin_a,
@@ -33,22 +37,41 @@ void encoder_init(encoder_t *enc,
     enc->pullup = pullup;
     enc->mode = mode;
 
-    gpio_config_t io_conf = {
-        .pin_bit_mask = (1ULL << pin_a) | (1ULL << pin_b),
-        .mode         = GPIO_MODE_INPUT,
-        .pull_up_en   = pullup ? GPIO_PULLUP_ENABLE  : GPIO_PULLUP_DISABLE,
-        .pull_down_en = pullup ? GPIO_PULLDOWN_DISABLE : GPIO_PULLDOWN_ENABLE,
-        .intr_type    = GPIO_INTR_DISABLE
-    };
-    gpio_config(&io_conf);
+#ifdef CONFIG_USE_IO_EXPANDER
+    // Check if pins are IO expander pins (pin numbers 0-15 for TCA9535)
+    enc->use_io_expander = (pin_a < 16 && pin_b < 16);
+    if (enc->use_io_expander) {
+        // IO expander pins - no GPIO config needed, TCA9535 handles it
+        bool sig_a = false, sig_b = false;
+        io_manager_get_encoder_signals(&sig_a, &sig_b);
+        int sig1 = sig_a ? 1 : 0;
+        int sig2 = sig_b ? 1 : 0;
+        enc->old_state = (int8_t)(sig1 | (sig2 << 1));
+    } else
+#else
+    enc->use_io_expander = false;
+#endif
+    {
+        // Direct ESP32 GPIO pins
+        gpio_config_t io_conf = {
+            .pin_bit_mask = (1ULL << pin_a) | (1ULL << pin_b),
+            .mode         = GPIO_MODE_INPUT,
+            .pull_up_en   = pullup ? GPIO_PULLUP_ENABLE  : GPIO_PULLUP_DISABLE,
+            .pull_down_en = pullup ? GPIO_PULLDOWN_DISABLE : GPIO_PULLDOWN_ENABLE,
+            .intr_type    = GPIO_INTR_DISABLE
+        };
+        gpio_config(&io_conf);
 
-    int sig1 = gpio_get_level(pin_a);
-    int sig2 = gpio_get_level(pin_b);
-    enc->old_state = (int8_t)(sig1 | (sig2 << 1));
+        int sig1 = gpio_get_level(pin_a);
+        int sig2 = gpio_get_level(pin_b);
+        enc->old_state = (int8_t)(sig1 | (sig2 << 1));
+    }
 
     enc->position = 0;
+    enc->position_base_ext = 0;
     enc->position_ext = 0;
     enc->position_ext_prev = 0;
+    enc->pending_steps = 0;
     enc->pos_time_ms = enc->pos_time_prev_ms = now_ms();
     uint64_t now_us = esp_timer_get_time();
     enc->pos_time_us = now_us;
@@ -58,15 +81,30 @@ void encoder_init(encoder_t *enc,
     for (int i = 0; i < ENCODER_RPM_SMOOTHING_SIZE; ++i) enc->rpm_time_diffs_us[i] = 0;
 }
 
-
 /* poll-style tick (cheap enough to call from a tight loop or 1 kHz FreeRTOS timer) */
 void encoder_tick(encoder_t *enc)
 {
-    int sig1 = gpio_get_level(enc->pin_a);
-    int sig2 = gpio_get_level(enc->pin_b);
+    int sig1, sig2;
+#ifdef CONFIG_USE_IO_EXPANDER
+    if (enc->use_io_expander) {
+        // Read from IO expander
+        bool sig_a = false, sig_b = false;
+        if (!io_manager_get_encoder_signals(&sig_a, &sig_b)) {
+            return;
+        }
+        sig1 = sig_a ? 1 : 0;
+        sig2 = sig_b ? 1 : 0;
+    } else
+#endif
+    {
+        // Read from ESP32 GPIO
+        sig1 = gpio_get_level(enc->pin_a);
+        sig2 = gpio_get_level(enc->pin_b);
+    }
     int8_t this_state = (int8_t)(sig1 | (sig2 << 1));
 
     if (enc->old_state != this_state) {
+        ESP_LOGD("Encoder", "State change: %d -> %d (pins: %d, %d)", enc->old_state, this_state, sig1, sig2);
         enc->position += KNOBDIR[this_state | (enc->old_state << 2)];
         enc->old_state = this_state;
 
@@ -110,8 +148,11 @@ void encoder_tick(encoder_t *enc)
             }
 
             int32_t base_ext = (enc->mode == ENCODER_LATCH_TWO03) ? (enc->position >> 1) : (enc->position >> 2);
-            int32_t delta = base_ext - enc->position_ext;
-            enc->position_ext += delta * accel_mult;
+            int32_t detent_delta = base_ext - enc->position_base_ext;
+            if (detent_delta != 0) {
+                enc->position_base_ext = base_ext;
+                enc->pending_steps += detent_delta * accel_mult;
+            }
 
             enc->pos_time_prev_us = enc->pos_time_us;
             enc->pos_time_us = now_us;
@@ -126,16 +167,34 @@ int32_t encoder_get_position(const encoder_t *enc)
     return enc->position_ext;
 }
 
+encoder_direction_t encoder_peek_direction(const encoder_t *enc)
+{
+    if (enc->pending_steps > 0) return ENCODER_DIR_CW;
+    if (enc->pending_steps < 0) return ENCODER_DIR_CCW;
+    return ENCODER_DIR_NONE;
+}
+
+void encoder_consume_direction(encoder_t *enc, encoder_direction_t dir)
+{
+    if (dir == ENCODER_DIR_CW) {
+        if (enc->pending_steps <= 0) return;
+        enc->pending_steps--;
+        enc->position_ext++;
+    } else if (dir == ENCODER_DIR_CCW) {
+        if (enc->pending_steps >= 0) return;
+        enc->pending_steps++;
+        enc->position_ext--;
+    } else {
+        return;
+    }
+    enc->position_ext_prev = enc->position_ext;
+}
+
 encoder_direction_t encoder_get_direction(encoder_t *enc)
 {
-    if (enc->position_ext_prev < enc->position_ext) {
-        enc->position_ext_prev = enc->position_ext;
-        return ENCODER_DIR_CW;
-    } else if (enc->position_ext_prev > enc->position_ext) {
-        enc->position_ext_prev = enc->position_ext;
-        return ENCODER_DIR_CCW;
-    }
-    return ENCODER_DIR_NONE;
+    encoder_direction_t dir = encoder_peek_direction(enc);
+    encoder_consume_direction(enc, dir);
+    return dir;
 }
 
 uint32_t encoder_get_millis_between_rotations(const encoder_t *enc)
