@@ -3,6 +3,7 @@
 #include "core/commandline.h"
 #include "core/callbacks.h"
 #include "core/serial_manager.h"
+#include "core/utils.h"
 #include "esp_sntp.h"
 #include "managers/ap_manager.h"
 #include "sdkconfig.h"
@@ -229,7 +230,7 @@ CommandFunction find_command(const char *name) {
 }
 
 void handle_unknown_command(const char *cmd) {
-    glog("Unknown command: %s\n", cmd);
+    glog("Unsupported command: %s\n", cmd);
 }
 
 void cmd_wifi_scan_start(int argc, char **argv) {
@@ -2511,7 +2512,7 @@ void handle_eth_config_cmd(int argc, char **argv) {
             glog("  Gateway: %s\n", gw_str);
         }
     } else {
-        glog("Unknown command: %s\n", argv[1]);
+        glog("Unsupported command: %s\n", argv[1]);
     }
 }
 
@@ -2566,7 +2567,7 @@ void handle_eth_mac_cmd(int argc, char **argv) {
             glog("Failed to set MAC address: %s\n", esp_err_to_name(ret));
         }
     } else {
-        glog("Unknown command: %s\n", argv[1]);
+        glog("Unsupported command: %s\n", argv[1]);
     }
 }
 
@@ -5892,9 +5893,17 @@ void handle_setcountry(int argc, char **argv) {
         status_display_show_status("Country Usage");
         return;
     }
-    esp_err_t err = esp_wifi_set_country_code(argv[1], true);
+
+    char cc_upper[4];
+    if (!str_copy_upper(cc_upper, sizeof(cc_upper), argv[1])) {
+        glog("failed to set country: invalid country code\n");
+        status_display_show_status("Country Fail");
+        return;
+    }
+
+    esp_err_t err = esp_wifi_set_country_code(cc_upper, true);
     if (err == ESP_OK) {
-        glog("country set to %s\n", argv[1]);
+        glog("country set to %s\n", cc_upper);
         status_display_show_status("Country Set");
     } else {
         glog("failed to set country: %s\n", esp_err_to_name(err));
@@ -7941,7 +7950,7 @@ void handle_evilportal(int argc, char **argv) {
         wifi_manager_clear_html_buffer();
         glog("HTML buffer cleared - will use default portal on next startportal\n");
     } else {
-        glog("Error: Unknown command '%s'\n", argv[2]);
+        glog("Error: Unsupported command '%s'\n", argv[2]);
     }
 }
 
