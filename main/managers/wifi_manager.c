@@ -1806,7 +1806,8 @@ void wifi_manager_start_scan() {
         .show_hidden = true,
         .scan_time = {.active.min = 450, .active.max = 500, .passive = 500}};
 
-    rgb_manager_set_color(&rgb_manager, -1, 50, 255, 50, false);
+    // Set RGB to custom purple during AP scan (R=80, G=0, B=130)
+    rgb_manager_set_color(&rgb_manager, -1, 80, 0, 130, false);
 
     printf("WiFi Scan started\n");
     #ifdef CONFIG_IDF_TARGET_ESP32C5
@@ -1953,13 +1954,13 @@ void wifi_manager_list_stations() {
         printf("[%d] Station MAC: %s\n", i, sta_mac_str);
         printf("     Station Vendor: %s\n", sta_vendor);
         printf("     Associated AP: %s\n", sanitized_ssid);
-        printf("     AP BSSID: %s\n", ap_mac_str);
+        printf("     %s\n", ap_mac_str);
         printf("     AP Vendor: %s\n", ap_vendor);
 
         TERMINAL_VIEW_ADD_TEXT("[%d] Station MAC: %s\n", i, sta_mac_str);
         TERMINAL_VIEW_ADD_TEXT("     Station Vendor: %s\n", sta_vendor);
         TERMINAL_VIEW_ADD_TEXT("     Associated AP: %s\n", sanitized_ssid);
-        TERMINAL_VIEW_ADD_TEXT("     AP BSSID: %s\n", ap_mac_str);
+        TERMINAL_VIEW_ADD_TEXT("     %s\n", ap_mac_str);
         TERMINAL_VIEW_ADD_TEXT("     AP Vendor: %s\n", ap_vendor);
     }
 }
@@ -2345,17 +2346,19 @@ void wifi_manager_select_multiple_aps(int *indices, int count) {
         char sanitized_ssid[33];
         sanitize_ssid_and_check_hidden(selected_aps[i].ssid, sanitized_ssid, sizeof(sanitized_ssid));
 
-        printf("[%d] SSID: %s, BSSID: %02X:%02X:%02X:%02X:%02X:%02X%s\n",
-               i, sanitized_ssid,
-               selected_aps[i].bssid[0], selected_aps[i].bssid[1], selected_aps[i].bssid[2],
-               selected_aps[i].bssid[3], selected_aps[i].bssid[4], selected_aps[i].bssid[5],
-               (i == 0) ? " (Primary)" : "");
+         printf("[%d]%s\n%s\n%02X:%02X:%02X:%02X:%02X:%02X\n",
+             i,
+             (i == 0) ? " (Primary)" : "",
+             sanitized_ssid,
+             selected_aps[i].bssid[0], selected_aps[i].bssid[1], selected_aps[i].bssid[2],
+             selected_aps[i].bssid[3], selected_aps[i].bssid[4], selected_aps[i].bssid[5]);
 
-        TERMINAL_VIEW_ADD_TEXT("[%d] SSID: %s, BSSID: %02X:%02X:%02X:%02X:%02X:%02X%s\n",
-               i, sanitized_ssid,
-               selected_aps[i].bssid[0], selected_aps[i].bssid[1], selected_aps[i].bssid[2],
-               selected_aps[i].bssid[3], selected_aps[i].bssid[4], selected_aps[i].bssid[5],
-               (i == 0) ? " (Primary)" : "");
+         TERMINAL_VIEW_ADD_TEXT("[%d]%s\n%s\n%02X:%02X:%02X:%02X:%02X:%02X\n",
+             i,
+             (i == 0) ? " (Primary)" : "",
+             sanitized_ssid,
+             selected_aps[i].bssid[0], selected_aps[i].bssid[1], selected_aps[i].bssid[2],
+             selected_aps[i].bssid[3], selected_aps[i].bssid[4], selected_aps[i].bssid[5]);
     }
 
     printf("Multiple APs selected successfully. Primary AP: %s\n", 
@@ -3871,31 +3874,25 @@ static void wifi_manager_print_ap_entry_formatted(uint16_t idx, const wifi_ap_re
     char vendor[64] = {0};
     bool has_vendor = ouis_lookup_vendor(mac_str, vendor, sizeof(vendor));
 
-    printf("[%u] SSID: %s,\n"
-           "     BSSID: %02X:%02X:%02X:%02X:%02X:%02X,\n"
-           "     RSSI: %d,\n"
-           "     Channel: %d,\n",
-           idx,
-           sanitized_ssid,
-           rec->bssid[0], rec->bssid[1], rec->bssid[2], rec->bssid[3], rec->bssid[4], rec->bssid[5],
-           rec->rssi,
-           rec->primary);
-    TERMINAL_VIEW_ADD_TEXT("[%u] SSID: %s,\n"
-                           "     BSSID: %02X:%02X:%02X:%02X:%02X:%02X,\n"
-                           "     RSSI: %d,\n"
-                           "     Channel: %d,\n",
-                           idx,
-                           sanitized_ssid,
-                           rec->bssid[0], rec->bssid[1], rec->bssid[2], rec->bssid[3], rec->bssid[4], rec->bssid[5],
-                           rec->rssi,
-                           rec->primary);
+        printf("[%u]\n%s\n%02X:%02X:%02X:%02X:%02X:%02X\nRSSI: %d\nChannel: %d\n",
+            idx,
+            sanitized_ssid,
+            rec->bssid[0], rec->bssid[1], rec->bssid[2], rec->bssid[3], rec->bssid[4], rec->bssid[5],
+            rec->rssi,
+            rec->primary);
+        TERMINAL_VIEW_ADD_TEXT("[%u]\n%s\n%02X:%02X:%02X:%02X:%02X:%02X\nRSSI: %d\nChannel: %d\n",
+                      idx,
+                      sanitized_ssid,
+                      rec->bssid[0], rec->bssid[1], rec->bssid[2], rec->bssid[3], rec->bssid[4], rec->bssid[5],
+                      rec->rssi,
+                      rec->primary);
 
 #if defined(CONFIG_IDF_TARGET_ESP32C5) || defined(CONFIG_IDF_TARGET_ESP32C6)
     if (include_security) {
         int ch = rec->primary;
         const char *band_str = (ch > 14) ? "5GHz" : "2.4GHz";
-        printf("     Band: %s,\n", band_str);
-        TERMINAL_VIEW_ADD_TEXT("     Band: %s,\n", band_str);
+        printf("Band: %s\n", band_str);
+        TERMINAL_VIEW_ADD_TEXT("Band: %s\n", band_str);
 
         const char *auth_str = "Unknown";
         const char *pmf_str = NULL;
@@ -3913,18 +3910,18 @@ static void wifi_manager_print_ap_entry_formatted(uint16_t idx, const wifi_ap_re
             default: auth_str = "Unknown"; break;
         }
         if (pmf_str) {
-            printf("     Security: %s\n     PMF: %s\n", auth_str, pmf_str);
-            TERMINAL_VIEW_ADD_TEXT("     Security: %s\n     PMF: %s\n", auth_str, pmf_str);
+            printf("Security: %s\nPMF: %s\n", auth_str, pmf_str);
+            TERMINAL_VIEW_ADD_TEXT("Security: %s\nPMF: %s\n", auth_str, pmf_str);
         } else {
-            printf("     Security: %s\n", auth_str);
-            TERMINAL_VIEW_ADD_TEXT("     Security: %s\n", auth_str);
+            printf("Security: %s\n", auth_str);
+            TERMINAL_VIEW_ADD_TEXT("Security: %s\n", auth_str);
         }
     }
 #endif
 
     if (has_vendor) {
-        printf("     Vendor: %s\n", vendor);
-        TERMINAL_VIEW_ADD_TEXT("     Vendor: %s\n", vendor);
+        printf("Vendor: %s\n", vendor);
+        TERMINAL_VIEW_ADD_TEXT("Vendor: %s\n", vendor);
     }
 }
 void wifi_manager_print_scan_results_with_oui() {
@@ -3947,22 +3944,19 @@ void wifi_manager_print_scan_results_with_oui() {
         char vendor[64] = {0};
         bool has_vendor = ouis_lookup_vendor(mac_str, vendor, sizeof(vendor));
 
-        glog("[%u] SSID: %s,\n"
-             "     BSSID: %02X:%02X:%02X:%02X:%02X:%02X,\n"
-             "     RSSI: %d,\n"
-             "     Channel: %d,\n",
-             i, sanitized_ssid, 
-             scanned_aps[i].bssid[0], scanned_aps[i].bssid[1],
-             scanned_aps[i].bssid[2], scanned_aps[i].bssid[3],
-             scanned_aps[i].bssid[4], scanned_aps[i].bssid[5],
-             scanned_aps[i].rssi,
-             scanned_aps[i].primary);
+           glog("[%u]\n%s\n%02X:%02X:%02X:%02X:%02X:%02X\nRSSI: %d\nChannel: %d\n",
+               i, sanitized_ssid, 
+               scanned_aps[i].bssid[0], scanned_aps[i].bssid[1],
+               scanned_aps[i].bssid[2], scanned_aps[i].bssid[3],
+               scanned_aps[i].bssid[4], scanned_aps[i].bssid[5],
+               scanned_aps[i].rssi,
+               scanned_aps[i].primary);
 
 #if defined(CONFIG_IDF_TARGET_ESP32C5) || defined(CONFIG_IDF_TARGET_ESP32C6)
         {
             int ch = scanned_aps[i].primary;
             const char *band_str = (ch > 14) ? "5GHz" : "2.4GHz";
-            glog("     Band: %s,\n", band_str);
+            glog("Band: %s\n", band_str);
             
             const char *auth_str = "Unknown";
             const char *pmf_str = NULL;
@@ -4007,14 +4001,14 @@ void wifi_manager_print_scan_results_with_oui() {
             }
             
             if (pmf_str) {
-                glog("     Security: %s\n     PMF: %s\n", auth_str, pmf_str);
+                glog("Security: %s\nPMF: %s\n", auth_str, pmf_str);
             } else {
-                glog("     Security: %s\n", auth_str);
+                glog("Security: %s\n", auth_str);
             }
         }
 #endif
         if (has_vendor) {
-            glog("     Vendor: %s\n", vendor);
+            glog("Vendor: %s\n", vendor);
         }
     }
 }
