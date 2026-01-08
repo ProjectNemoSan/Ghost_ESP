@@ -1,0 +1,3 @@
+This is just a custom build with light modifications. The only things I changed are the color of the RGB
+lights when running an AP scan, I changed them from green to purple. I also left-aligned the output of the 
+WiFi scans, for a more tidier output. Nothing special. 
